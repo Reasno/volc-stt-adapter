@@ -6,6 +6,8 @@ services:
     container_name: volc-stt-adapter
     env_file:
       - .env
+    volumes:
+      - /var/lib/homeassistant/homeassistant/.storage:/var/lib/homeassistant/homeassistant/.storage:ro
     network_mode: host
     restart: unless-stopped
     healthcheck:
