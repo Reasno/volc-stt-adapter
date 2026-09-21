@@ -1,0 +1,20 @@
+services:
+  volc-stt-adapter:
+    build:
+      context: .
+    image: volc-stt-adapter:latest
+    container_name: volc-stt-adapter
+    env_file:
+      - .env
+    network_mode: host
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; s=socket.create_connection(('127.0.0.1', 8765), 3); s.close()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
