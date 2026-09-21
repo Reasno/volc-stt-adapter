@@ -2,7 +2,7 @@ services:
   volc-stt-adapter:
     build:
       context: .
-    image: volc-stt-adapter:latest
+    image: reasno/volc-stt-adapter:latest
     container_name: volc-stt-adapter
     env_file:
       - .env
