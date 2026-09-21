@@ -12,6 +12,7 @@ import logging
 import os
 import signal
 import struct
+import time
 import uuid
 import wave
 from dataclasses import dataclass
@@ -35,6 +36,9 @@ POS_SEQUENCE = 0x1
 NEG_WITH_SEQUENCE = 0x3
 SERIALIZATION_JSON = 0x1
 COMPRESSION_GZIP = 0x1
+
+KEYWORD_GATE_WORDS = ("reachy", "瑞奇", "瑞琪", "瑞吉")
+KEYWORD_GATE_WINDOW_S = 30.0
 
 
 def load_dotenv(path: str | None) -> None:
@@ -89,6 +93,8 @@ class Settings:
     resource_id: str
     sample_rate: int
     volc_timeout_s: float
+    boosting_table_id: str
+    keyword_gate_enabled: bool
     upstream_mode: str
     upstream_url: str
     upstream_session_url: str
@@ -130,6 +136,9 @@ class Settings:
             resource_id=resource_id,
             sample_rate=int(os.getenv("AUDIO_SAMPLE_RATE", "16000")),
             volc_timeout_s=float(os.getenv("VOLC_TIMEOUT_SECONDS", "30")),
+            boosting_table_id=os.getenv("VOLC_BOOSTING_TABLE_ID", "").strip(),
+            keyword_gate_enabled=os.getenv("KEYWORD_GATE_ENABLED", "true").strip().lower()
+            not in {"0", "false", "no", "off"},
             upstream_mode=os.getenv("UPSTREAM_MODE", "allocator").strip().lower(),
             upstream_url=os.getenv("UPSTREAM_REALTIME_URL", "").strip(),
             upstream_session_url=os.getenv(
@@ -271,6 +280,10 @@ class VolcengineStream:
                 "enable_nonstream": True,
             },
         }
+        if self.settings.boosting_table_id:
+            request["request"]["corpus"] = {
+                "boosting_table_id": self.settings.boosting_table_id,
+            }
         await self._send(CLIENT_FULL_REQUEST, POS_SEQUENCE, json.dumps(request).encode(), SERIALIZATION_JSON)
         acknowledgement = await self._receive_one()
         self._raise_for_error(acknowledgement)
@@ -358,8 +371,19 @@ class VolcengineStream:
                             if key in self.seen_utterances:
                                 continue
                             self.seen_utterances.add(key)
-                            LOG.info("[%s] native VAD definite: %s", self.item_id, utterance_text)
-                            await self.on_definite(utterance_text)
+                            additions = utterance.get("additions")
+                            speaker_id = None
+                            if isinstance(additions, dict):
+                                raw_speaker_id = additions.get("speaker_id")
+                                if raw_speaker_id is not None:
+                                    speaker_id = str(raw_speaker_id).strip() or None
+                            LOG.info(
+                                "[%s] native VAD definite: speaker_id=%s text=%s",
+                                self.item_id,
+                                speaker_id,
+                                utterance_text,
+                            )
+                            await self.on_definite(utterance_text, speaker_id)
                 if response["is_last"]:
                     return
         except asyncio.CancelledError:
@@ -384,6 +408,8 @@ class RealtimeAdapterConnection:
         self.stream: VolcengineStream | None = None
         self.item_id: str | None = None
         self.upstream_response_active = False
+        self.keyword_gate_expires_at = 0.0
+        self.keyword_gate_speaker_id: str | None = None
 
     async def emit(self, event_type: str, **fields: Any) -> None:
         event = {"event_id": f"event_{uuid.uuid4().hex}", "type": event_type, **fields}
@@ -568,10 +594,56 @@ class RealtimeAdapterConnection:
 
         await self.stream.send_audio(pcm)
 
-    async def _on_native_utterance(self, transcript: str) -> None:
+    async def _on_native_utterance(
+        self, transcript: str, speaker_id: str | None = None
+    ) -> None:
         transcript = transcript.strip()
         if not transcript:
             return
+
+        if self.settings.keyword_gate_enabled:
+            now = time.time()
+            has_keyword = any(keyword in transcript.casefold() for keyword in KEYWORD_GATE_WORDS)
+            if has_keyword:
+                if (
+                    now < self.keyword_gate_expires_at
+                    and self.keyword_gate_speaker_id is not None
+                    and speaker_id is not None
+                    and speaker_id != self.keyword_gate_speaker_id
+                ):
+                    LOG.info(
+                        "Keyword gate binding replaced: previous=%s new=%s",
+                        self.keyword_gate_speaker_id,
+                        speaker_id,
+                    )
+                self.keyword_gate_expires_at = now + KEYWORD_GATE_WINDOW_S
+                self.keyword_gate_speaker_id = speaker_id
+                LOG.info(
+                    "Keyword gate opened for %.0fs: speaker_id=%s",
+                    KEYWORD_GATE_WINDOW_S,
+                    speaker_id,
+                )
+            elif now >= self.keyword_gate_expires_at:
+                self.keyword_gate_expires_at = 0.0
+                self.keyword_gate_speaker_id = None
+                LOG.info("Keyword gate suppressed transcript: wake window inactive")
+                return
+            elif (
+                self.keyword_gate_speaker_id is not None
+                and speaker_id is not None
+                and speaker_id != self.keyword_gate_speaker_id
+            ):
+                LOG.info(
+                    "Keyword gate closed after speaker changed: expected=%s actual=%s",
+                    self.keyword_gate_speaker_id,
+                    speaker_id,
+                )
+                self.keyword_gate_expires_at = 0.0
+                self.keyword_gate_speaker_id = None
+                return
+            else:
+                self.keyword_gate_expires_at = now + KEYWORD_GATE_WINDOW_S
+
         item_id = f"item_{uuid.uuid4().hex}"
         if self.upstream_response_active:
             await self._send_upstream(
