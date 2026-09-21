@@ -277,7 +277,9 @@ class VolcengineStream:
                 "enable_punc": True,
                 "enable_ddc": True,
                 "show_utterances": True,
-                "enable_nonstream": True,
+                "enable_nonstream": False,
+                "vad_config": {"end_window_size": 500},
+                "speaker_info": {"speaker_number": 10},
             },
         }
         if self.settings.boosting_table_id:
