@@ -15,7 +15,7 @@ services:
         - CMD
         - python
         - -c
-        - "import socket; s=socket.create_connection(('127.0.0.1', 8765), 3); s.close()"
+        - "p='223D'; files=('/proc/net/tcp','/proc/net/tcp6'); assert any(line.split()[1].endswith(':'+p) and line.split()[3]=='0A' for f in files for line in open(f).read().splitlines()[1:])"
       interval: 30s
       timeout: 5s
       retries: 3
