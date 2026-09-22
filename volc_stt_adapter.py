@@ -278,6 +278,7 @@ class VolcengineStream:
                 "enable_ddc": True,
                 "show_utterances": True,
                 "enable_nonstream": True,
+                "enable_speaker_info": True,
             },
         }
         if self.settings.boosting_table_id:
@@ -375,9 +376,13 @@ class VolcengineStream:
                             LOG.debug("[%s] utterance additions raw: %s | utterance keys: %s", self.item_id, additions, list(utterance.keys()))
                             speaker_id = None
                             if isinstance(additions, dict):
-                                raw_speaker_id = additions.get("speaker_id")
-                                if raw_speaker_id is not None:
-                                    speaker_id = str(raw_speaker_id).strip() or None
+                                raw = additions.get("speaker_id") or additions.get("speaker")
+                                if raw is not None:
+                                    speaker_id = str(raw).strip() or None
+                            if speaker_id is None:
+                                raw = utterance.get("speaker_id")
+                                if raw is not None:
+                                    speaker_id = str(raw).strip() or None
                             LOG.info(
                                 "[%s] native VAD definite: speaker_id=%s text=%s",
                                 self.item_id,
