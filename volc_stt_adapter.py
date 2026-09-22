@@ -278,7 +278,7 @@ class VolcengineStream:
                 "enable_ddc": True,
                 "show_utterances": True,
                 "enable_nonstream": False,
-                "vad_config": {"end_window_size": 500, "force_to_speech_time": 1000},
+                "vad_config": {"end_window_size": 500},
                 "speaker_info": {"speaker_number": 10},
             },
         }
