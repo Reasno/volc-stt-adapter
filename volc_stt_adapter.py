@@ -629,6 +629,18 @@ class RealtimeAdapterConnection:
                     speaker_id,
                 )
             elif (
+                has_keyword
+                and speaker_id is not None
+                and speaker_id != self.keyword_gate_speaker_id
+            ):
+                LOG.info(
+                    "Keyword gate binding replaced: previous=%s new=%s",
+                    self.keyword_gate_speaker_id,
+                    speaker_id,
+                )
+                self.keyword_gate_speaker_id = speaker_id
+                self.keyword_gate_expires_at = now + KEYWORD_GATE_WINDOW_S
+            elif (
                 speaker_id is not None
                 and self.keyword_gate_speaker_id is not None
                 and speaker_id != self.keyword_gate_speaker_id
