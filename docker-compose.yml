@@ -9,7 +9,7 @@ services:
     environment:
       # Prefix-only wake words (comma-separated). Edit here, then
       # `docker compose up -d` to apply -- no image rebuild needed.
-      - VOLC_GATE_PREFIX_WORDS=语音,微信,一起,云溪,微启,允许,机器
+      - VOLC_GATE_PREFIX_WORDS=语音,微信,一起,云溪,微启,允许,机器,运气
     volumes:
       - /var/lib/homeassistant/homeassistant/.storage:/var/lib/homeassistant/homeassistant/.storage:ro
     network_mode: host
