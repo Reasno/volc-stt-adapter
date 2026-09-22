@@ -255,6 +255,10 @@ class VolcengineStream:
         self.latest_text = ""
         self.last_emitted_text = ""
         self.seen_utterances: set[tuple[Any, Any, str]] = set()
+        # Idempotency: dedup by unique utterance item_id so that upstream WS
+        # reconnect flushes (which re-emit historical items) don't get processed
+        # twice. Scoped to this stream; cleared implicitly on stream close.
+        self.seen_item_ids: set[str] = set()
         self.error: Exception | None = None
         self._closed = False
 
@@ -383,6 +387,22 @@ class VolcengineStream:
                             if key in self.seen_utterances:
                                 continue
                             self.seen_utterances.add(key)
+                            # Idempotency key: prefer the utterance's unique
+                            # item_id (Volcengine may re-flush historical items
+                            # on WS reconnect). Fall back to additions.item_id.
+                            item_id_raw: Any = utterance.get("item_id")
+                            if item_id_raw is None and isinstance(additions := utterance.get("additions"), dict):
+                                item_id_raw = additions.get("item_id")
+                            if item_id_raw is not None:
+                                item_id_key = str(item_id_raw)
+                                if item_id_key in self.seen_item_ids:
+                                    LOG.debug(
+                                        "[%s] dropping duplicate utterance item_id=%s",
+                                        self.item_id,
+                                        item_id_key,
+                                    )
+                                    continue
+                                self.seen_item_ids.add(item_id_key)
                             additions = utterance.get("additions")
                             LOG.debug("[%s] utterance additions raw: %s | utterance keys: %s", self.item_id, additions, list(utterance.keys()))
                             speaker_id = None
@@ -425,8 +445,12 @@ class RealtimeAdapterConnection:
         self.stream: VolcengineStream | None = None
         self.item_id: str | None = None
         self.upstream_response_active = False
-        self.keyword_gate_expires_at = 0.0
-        self.keyword_gate_speaker_id: str | None = None
+        # Multi-speaker gate: any speaker who says a wake word gets their own
+        # 30s activation window. Multiple speakers can be active concurrently;
+        # each speaker's window is refreshed independently. Key is the
+        # speaker_id string, or "__unknown__" when the ASR did not label the
+        # utterance with a speaker.
+        self.keyword_gate_speakers: dict[str, float] = {}
 
     async def emit(self, event_type: str, **fields: Any) -> None:
         event = {"event_id": f"event_{uuid.uuid4().hex}", "type": event_type, **fields}
@@ -620,6 +644,12 @@ class RealtimeAdapterConnection:
 
         if self.settings.keyword_gate_enabled:
             now = time.time()
+            # Prune expired speaker windows first.
+            expired = [sid for sid, exp in self.keyword_gate_speakers.items() if exp <= now]
+            for sid in expired:
+                LOG.info("Keyword gate expired for speaker_id=%s", sid)
+                self.keyword_gate_speakers.pop(sid, None)
+
             transcript_normalized = transcript.lower().strip()
             transcript_head = transcript_normalized.lstrip("，。！？、,.!?~ ")
             has_keyword = any(
@@ -629,45 +659,29 @@ class RealtimeAdapterConnection:
                 transcript_head.startswith(prefix)
                 for prefix in self.settings.keyword_gate_prefix_words
             )
-            gate_active = now < self.keyword_gate_expires_at
-            if not gate_active:
-                self.keyword_gate_expires_at = 0.0
-                self.keyword_gate_speaker_id = None
-                if not has_keyword:
-                    LOG.info("Keyword gate suppressed transcript: wake window inactive")
-                    return
-                self.keyword_gate_expires_at = now + KEYWORD_GATE_WINDOW_S
-                self.keyword_gate_speaker_id = speaker_id
+
+            speaker_key = speaker_id if speaker_id is not None else "__unknown__"
+
+            if has_keyword:
+                new_activation = speaker_key not in self.keyword_gate_speakers
+                self.keyword_gate_speakers[speaker_key] = now + KEYWORD_GATE_WINDOW_S
                 LOG.info(
-                    "Keyword gate opened for %.0fs: speaker_id=%s",
+                    "Keyword gate %s for %.0fs: speaker_id=%s active=%s",
+                    "opened" if new_activation else "refreshed",
                     KEYWORD_GATE_WINDOW_S,
                     speaker_id,
+                    sorted(self.keyword_gate_speakers.keys()),
                 )
-            elif (
-                has_keyword
-                and speaker_id is not None
-                and speaker_id != self.keyword_gate_speaker_id
-            ):
-                LOG.info(
-                    "Keyword gate binding replaced: previous=%s new=%s",
-                    self.keyword_gate_speaker_id,
-                    speaker_id,
-                )
-                self.keyword_gate_speaker_id = speaker_id
-                self.keyword_gate_expires_at = now + KEYWORD_GATE_WINDOW_S
-            elif (
-                speaker_id is not None
-                and self.keyword_gate_speaker_id is not None
-                and speaker_id != self.keyword_gate_speaker_id
-            ):
-                LOG.info(
-                    "Keyword gate ignored non-target speaker: target=%s speaker_id=%s",
-                    self.keyword_gate_speaker_id,
-                    speaker_id,
-                )
-                return
             else:
-                self.keyword_gate_expires_at = now + KEYWORD_GATE_WINDOW_S
+                if speaker_key not in self.keyword_gate_speakers:
+                    LOG.info(
+                        "Keyword gate suppressed transcript: speaker_id=%s not in active set %s",
+                        speaker_id,
+                        sorted(self.keyword_gate_speakers.keys()),
+                    )
+                    return
+                # Active speaker keeps talking — extend their own window only.
+                self.keyword_gate_speakers[speaker_key] = now + KEYWORD_GATE_WINDOW_S
 
         item_id = f"item_{uuid.uuid4().hex}"
         if self.upstream_response_active:
