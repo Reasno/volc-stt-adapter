@@ -638,19 +638,6 @@ class RealtimeAdapterConnection:
                 self.keyword_gate_speaker_id = None
                 LOG.info("Keyword gate suppressed transcript: wake window inactive")
                 return
-            elif (
-                self.keyword_gate_speaker_id is not None
-                and speaker_id is not None
-                and speaker_id != self.keyword_gate_speaker_id
-            ):
-                LOG.info(
-                    "Keyword gate closed after speaker changed: expected=%s actual=%s",
-                    self.keyword_gate_speaker_id,
-                    speaker_id,
-                )
-                self.keyword_gate_expires_at = 0.0
-                self.keyword_gate_speaker_id = None
-                return
             else:
                 self.keyword_gate_expires_at = now + KEYWORD_GATE_WINDOW_S
 
