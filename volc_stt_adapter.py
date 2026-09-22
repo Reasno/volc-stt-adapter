@@ -37,7 +37,7 @@ NEG_WITH_SEQUENCE = 0x3
 SERIALIZATION_JSON = 0x1
 COMPRESSION_GZIP = 0x1
 
-KEYWORD_GATE_WORDS = ("reachy", "瑞奇", "瑞琪", "瑞吉", "richie", "ricky", "richey", "riche")
+KEYWORD_GATE_WORDS = ("reachy", "瑞奇", "瑞琪", "瑞吉", "richie", "ricky", "richey", "riche", "reach")
 KEYWORD_GATE_WINDOW_S = 30.0
 
 
