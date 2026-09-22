@@ -41,7 +41,7 @@ KEYWORD_GATE_WORDS = ("reachy", "瑞奇", "瑞琪", "瑞吉", "richie", "ricky",
 # Prefix-only wake words: open the gate only when the utterance *starts* with
 # one of these (common ASR mishearings of the wake phrase); a mid-sentence
 # occurrence must not count.
-KEYWORD_GATE_PREFIX_WORDS = ("语音", "微信", "一起", "云溪", "微启")
+KEYWORD_GATE_PREFIX_WORDS = ("语音", "微信", "一起", "云溪", "微启", "允许")
 KEYWORD_GATE_WINDOW_S = 30.0
 
 
