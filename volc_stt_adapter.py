@@ -38,6 +38,10 @@ SERIALIZATION_JSON = 0x1
 COMPRESSION_GZIP = 0x1
 
 KEYWORD_GATE_WORDS = ("reachy", "瑞奇", "瑞琪", "瑞吉", "richie", "ricky", "richey", "riche", "reach")
+# Prefix-only wake words: open the gate only when the utterance *starts* with
+# one of these (common ASR mishearings of the wake phrase); a mid-sentence
+# occurrence must not count.
+KEYWORD_GATE_PREFIX_WORDS = ("语音", "微信", "一起", "云溪", "微启")
 KEYWORD_GATE_WINDOW_S = 30.0
 
 
@@ -610,9 +614,13 @@ class RealtimeAdapterConnection:
         if self.settings.keyword_gate_enabled:
             now = time.time()
             transcript_normalized = transcript.lower().strip()
+            transcript_head = transcript_normalized.lstrip("，。！？、,.!?~ ")
             has_keyword = any(
                 keyword.lower().strip() in transcript_normalized
                 for keyword in KEYWORD_GATE_WORDS
+            ) or any(
+                transcript_head.startswith(prefix)
+                for prefix in KEYWORD_GATE_PREFIX_WORDS
             )
             gate_active = now < self.keyword_gate_expires_at
             if not gate_active:
