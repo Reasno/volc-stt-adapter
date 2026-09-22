@@ -243,6 +243,13 @@ def wav_chunk(pcm: bytes, sample_rate: int) -> bytes:
 
 
 class VolcengineStream:
+    # Max transient reconnect attempts within RECONNECT_WINDOW_S before giving up.
+    # 5xxxxxxx 错误码 = 火山服务端 5xx（例如 55000000 grpc RST_STREAM、55000031
+    # 服务繁忙），视为可恢复。4xxxxxxx / 鉴权 / 参数错误一律 fail-fast。
+    RECONNECT_MAX_ATTEMPTS = 3
+    RECONNECT_WINDOW_S = 60.0
+    RECONNECT_BACKOFF_S = (0.5, 1.5, 3.0)
+
     def __init__(self, settings: Settings, language: str, stream_id: str, on_definite):
         self.settings = settings
         self.language = language
@@ -256,8 +263,24 @@ class VolcengineStream:
         self.last_emitted_text = ""
         self.error: Exception | None = None
         self._closed = False
+        # Guard against send_audio racing with reconnect swap of self.ws.
+        self._ws_lock = asyncio.Lock()
+        # Timestamps of recent successful reconnects for rate limiting.
+        self._reconnect_history: list[float] = []
 
     async def start(self, initial_pcm: bytes) -> None:
+        await self._connect_upstream()
+        self.receiver = asyncio.create_task(self._receive_loop(), name=f"volc-recv-{self.item_id}")
+        if initial_pcm:
+            await self.send_audio(wav_chunk(initial_pcm, self.settings.sample_rate))
+
+    async def _connect_upstream(self) -> None:
+        """(Re)connect to Volcengine and send the initial full_request handshake.
+
+        On reconnect we intentionally reuse the same item_id / uid so downstream
+        consumers still see a single logical stream, but reset the binary
+        protocol sequence counter (火山 sequence 从 1 开始递增，重连算新会话).
+        """
         headers = {
             "X-Api-Resource-Id": self.settings.resource_id,
             "X-Api-Connect-Id": str(uuid.uuid4()),
@@ -269,6 +292,14 @@ class VolcengineStream:
             headers["X-Api-Key"] = self.settings.app_key
 
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=self.settings.volc_timeout_s)
+        # Close any stale session/ws from a previous connection attempt.
+        if self.ws and not self.ws.closed:
+            with contextlib.suppress(Exception):
+                await self.ws.close()
+        if self.http and not self.http.closed:
+            with contextlib.suppress(Exception):
+                await self.http.close()
+        self.sequence = 1
         self.http = aiohttp.ClientSession(timeout=timeout)
         self.ws = await self.http.ws_connect(self.settings.volc_url, headers=headers, heartbeat=20)
         request = {
@@ -305,19 +336,82 @@ class VolcengineStream:
             request["request"]["corpus"] = {
                 "boosting_table_id": self.settings.boosting_table_id,
             }
-        await self._send(CLIENT_FULL_REQUEST, POS_SEQUENCE, json.dumps(request).encode(), SERIALIZATION_JSON)
-        acknowledgement = await self._receive_one()
-        self._raise_for_error(acknowledgement)
-        self.receiver = asyncio.create_task(self._receive_loop(), name=f"volc-recv-{self.item_id}")
-        if initial_pcm:
-            await self.send_audio(wav_chunk(initial_pcm, self.settings.sample_rate))
-
-    async def _send(self, message_type: int, flags: int, payload: bytes, serialization: int = 0) -> None:
-        if not self.ws:
-            raise RuntimeError("Volcengine stream is not connected")
-        frame = encode_request(message_type, flags, self.sequence, payload, serialization=serialization)
+        # Handshake: send inline (bypass _send lock — the lock is held by the
+        # caller during reconnect, and start() runs single-threaded before the
+        # receive loop is spawned).
+        payload = json.dumps(request).encode()
+        frame = encode_request(CLIENT_FULL_REQUEST, POS_SEQUENCE, self.sequence, payload, serialization=SERIALIZATION_JSON)
         self.sequence += 1
         await self.ws.send_bytes(frame)
+        acknowledgement = await self._receive_one()
+        self._raise_for_error(acknowledgement)
+
+    def _record_reconnect(self) -> bool:
+        """Return True if we may attempt another reconnect, respecting the rate limit."""
+        now = time.time()
+        self._reconnect_history = [
+            t for t in self._reconnect_history if now - t <= self.RECONNECT_WINDOW_S
+        ]
+        if len(self._reconnect_history) >= self.RECONNECT_MAX_ATTEMPTS:
+            return False
+        self._reconnect_history.append(now)
+        return True
+
+    async def _reconnect(self, reason: str) -> bool:
+        """Best-effort reconnect after a transient upstream error.
+
+        Returns True on success, False if we exceed the reconnect budget or the
+        reconnect itself keeps failing. Caller is responsible for stopping the
+        receive loop on False. On True, `self.ws` is a fresh WebSocket bound to
+        the same logical item_id and ready to accept audio frames.
+        """
+        if self._closed:
+            return False
+        if not self._record_reconnect():
+            LOG.error(
+                "[%s] Upstream reconnect budget exhausted (%d attempts / %.0fs); giving up. reason=%s",
+                self.item_id,
+                self.RECONNECT_MAX_ATTEMPTS,
+                self.RECONNECT_WINDOW_S,
+                reason,
+            )
+            return False
+        attempt = len(self._reconnect_history)
+        backoff = self.RECONNECT_BACKOFF_S[min(attempt - 1, len(self.RECONNECT_BACKOFF_S) - 1)]
+        LOG.warning(
+            "[%s] Upstream reconnect attempt %d/%d in %.1fs: reason=%s",
+            self.item_id,
+            attempt,
+            self.RECONNECT_MAX_ATTEMPTS,
+            backoff,
+            reason,
+        )
+        await asyncio.sleep(backoff)
+        try:
+            async with self._ws_lock:
+                await self._connect_upstream()
+        except Exception as exc:
+            LOG.warning("[%s] Upstream reconnect failed: %s", self.item_id, exc)
+            return False
+        LOG.info("[%s] Upstream reconnect succeeded", self.item_id)
+        return True
+
+    async def _send(self, message_type: int, flags: int, payload: bytes, serialization: int = 0) -> None:
+        # Serialize sends against reconnect swaps of self.ws / self.sequence.
+        # send_audio() 与 _reconnect() 都会持锁；接收方（_receive_loop）单独
+        # 读 self.ws，不走这把锁，重连时会自然拿到新 ws。
+        async with self._ws_lock:
+            if not self.ws:
+                raise RuntimeError("Volcengine stream is not connected")
+            frame = encode_request(message_type, flags, self.sequence, payload, serialization=serialization)
+            self.sequence += 1
+            try:
+                await self.ws.send_bytes(frame)
+            except (ConnectionClosed, ConnectionResetError, aiohttp.ClientError) as exc:
+                # 上游 ws 已经断了，_receive_loop 会看到 CLOSED 类消息并触发重连。
+                # 这里静默丢弃当前帧，让下一帧写入新连接。上游少一小段音频比
+                # 让整个 stream 崩掉更能保住体感。
+                LOG.debug("[%s] send_bytes on closed ws (%s), dropping frame", self.item_id, exc)
 
     async def send_audio(self, pcm: bytes) -> None:
         if not self._closed:
@@ -364,53 +458,88 @@ class VolcengineStream:
         if response["message_type"] == SERVER_ERROR_RESPONSE or response["code"]:
             raise RuntimeError(f"Volcengine ASR error: code={response['code']} payload={response['payload']}")
 
+    @staticmethod
+    def _is_transient_error(exc: BaseException) -> bool:
+        """5xxxxxxx = 火山服务端 5xx（RST_STREAM / 服务繁忙 / gRPC INTERNAL 等），
+        以及 aiohttp/websocket 层的连接断开，都视为暂态可恢复。
+        4xxxxxxx（鉴权/参数/资源）一律 fail-fast，不重连。"""
+        if isinstance(exc, (ConnectionClosed, ConnectionResetError, aiohttp.ClientError)):
+            return True
+        msg = str(exc)
+        # RuntimeError 走 code=5xxxxxxx 匹配。RST_STREAM 关键字兜底。
+        if "code=5" in msg and "code=5xx" not in msg:
+            return True
+        if "RST_STREAM" in msg:
+            return True
+        if "Unexpected Volcengine WebSocket message" in msg:
+            # e.g. server sent CLOSED before we asked to close.
+            return True
+        return False
+
     async def _receive_loop(self) -> None:
-        try:
-            while True:
-                response = await self._receive_one()
-                self._raise_for_error(response)
-                payload = response.get("payload")
-                if isinstance(payload, dict):
-                    result = payload.get("result")
-                    if isinstance(result, dict):
-                        LOG.debug("[%s] Volcengine result: %s", self.item_id, result)
-                        text = str(result.get("text") or "").strip()
-                        if text:
-                            self.latest_text = text
-                        utterances = result.get("utterances") or []
-                        for utterance in utterances:
-                            if not isinstance(utterance, dict) or not utterance.get("definite"):
-                                continue
-                            utterance_text = str(utterance.get("text") or "").strip()
-                            if not utterance_text:
-                                continue
-                            additions = utterance.get("additions")
-                            LOG.debug("[%s] utterance additions raw: %s | utterance keys: %s", self.item_id, additions, list(utterance.keys()))
-                            speaker_id = None
-                            if isinstance(additions, dict):
-                                raw = additions.get("speaker_id") or additions.get("speaker")
-                                if raw is not None:
-                                    speaker_id = str(raw).strip() or None
-                            if speaker_id is None:
-                                raw = utterance.get("speaker_id")
-                                if raw is not None:
-                                    speaker_id = str(raw).strip() or None
-                            LOG.info(
-                                "[%s] native VAD definite: speaker_id=%s text=%s",
-                                self.item_id,
-                                speaker_id,
-                                utterance_text,
-                            )
-                            await self.on_definite(utterance_text, speaker_id)
-                if response["is_last"]:
+        while True:
+            try:
+                while True:
+                    response = await self._receive_one()
+                    self._raise_for_error(response)
+                    payload = response.get("payload")
+                    if isinstance(payload, dict):
+                        result = payload.get("result")
+                        if isinstance(result, dict):
+                            LOG.debug("[%s] Volcengine result: %s", self.item_id, result)
+                            text = str(result.get("text") or "").strip()
+                            if text:
+                                self.latest_text = text
+                            utterances = result.get("utterances") or []
+                            for utterance in utterances:
+                                if not isinstance(utterance, dict) or not utterance.get("definite"):
+                                    continue
+                                utterance_text = str(utterance.get("text") or "").strip()
+                                if not utterance_text:
+                                    continue
+                                additions = utterance.get("additions")
+                                LOG.debug("[%s] utterance additions raw: %s | utterance keys: %s", self.item_id, additions, list(utterance.keys()))
+                                speaker_id = None
+                                if isinstance(additions, dict):
+                                    raw = additions.get("speaker_id") or additions.get("speaker")
+                                    if raw is not None:
+                                        speaker_id = str(raw).strip() or None
+                                if speaker_id is None:
+                                    raw = utterance.get("speaker_id")
+                                    if raw is not None:
+                                        speaker_id = str(raw).strip() or None
+                                LOG.info(
+                                    "[%s] native VAD definite: speaker_id=%s text=%s",
+                                    self.item_id,
+                                    speaker_id,
+                                    utterance_text,
+                                )
+                                await self.on_definite(utterance_text, speaker_id)
+                    if response["is_last"]:
+                        return
+            except asyncio.CancelledError:
+                raise
+            except ConnectionClosed as exc:
+                # Upstream socket dropped. Try to reconnect; if we can't, exit
+                # cleanly (mirror the pre-reconnect behavior of returning on
+                # ConnectionClosed rather than raising to caller).
+                if self._closed:
                     return
-        except asyncio.CancelledError:
-            raise
-        except ConnectionClosed:
-            return
-        except Exception as exc:
-            self.error = exc
-            LOG.exception("[%s] Volcengine receive failed", self.item_id)
+                if not await self._reconnect(f"ConnectionClosed: {exc}"):
+                    return
+                continue
+            except Exception as exc:
+                if self._closed:
+                    return
+                if self._is_transient_error(exc):
+                    LOG.warning("[%s] Transient upstream error, attempting reconnect: %s", self.item_id, exc)
+                    if not await self._reconnect(str(exc)):
+                        self.error = exc
+                        return
+                    continue
+                self.error = exc
+                LOG.exception("[%s] Volcengine receive failed (non-transient, giving up)", self.item_id)
+                return
 
 
 class RealtimeAdapterConnection:
