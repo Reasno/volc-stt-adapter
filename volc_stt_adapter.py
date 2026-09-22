@@ -277,6 +277,7 @@ class VolcengineStream:
                 "enable_punc": True,
                 "enable_ddc": True,
                 "show_utterances": True,
+                "enable_nonstream": True,
             },
         }
         if self.settings.boosting_table_id:
