@@ -40,8 +40,8 @@ COMPRESSION_GZIP = 0x1
 KEYWORD_GATE_WORDS = ("reachy", "瑞奇", "瑞琪", "瑞吉", "richie", "ricky", "richey", "riche", "reach")
 # Prefix-only wake words: open the gate only when the utterance *starts* with
 # one of these (common ASR mishearings of the wake phrase); a mid-sentence
-# occurrence must not count.
-KEYWORD_GATE_PREFIX_WORDS = ("语音", "微信", "一起", "云溪", "微启", "允许")
+# occurrence must not count. Override with VOLC_GATE_PREFIX_WORDS (comma-separated).
+DEFAULT_KEYWORD_GATE_PREFIX_WORDS = ("语音", "微信", "一起", "云溪", "微启", "允许", "机器")
 KEYWORD_GATE_WINDOW_S = 30.0
 
 
@@ -99,6 +99,7 @@ class Settings:
     volc_timeout_s: float
     boosting_table_id: str
     keyword_gate_enabled: bool
+    keyword_gate_prefix_words: tuple[str, ...]
     upstream_mode: str
     upstream_url: str
     upstream_session_url: str
@@ -130,6 +131,11 @@ class Settings:
         if missing:
             raise RuntimeError(f"Missing required credentials: {', '.join(missing)}")
 
+        prefix_words_raw = os.getenv("VOLC_GATE_PREFIX_WORDS", "").replace("，", ",")
+        keyword_gate_prefix_words = tuple(
+            word.strip() for word in prefix_words_raw.split(",") if word.strip()
+        ) or DEFAULT_KEYWORD_GATE_PREFIX_WORDS
+
         return cls(
             host=os.getenv("ADAPTER_HOST", "0.0.0.0"),
             port=int(os.getenv("ADAPTER_PORT", "8765")),
@@ -143,6 +149,7 @@ class Settings:
             boosting_table_id=os.getenv("VOLC_BOOSTING_TABLE_ID", "").strip(),
             keyword_gate_enabled=os.getenv("KEYWORD_GATE_ENABLED", "true").strip().lower()
             not in {"0", "false", "no", "off"},
+            keyword_gate_prefix_words=keyword_gate_prefix_words,
             upstream_mode=os.getenv("UPSTREAM_MODE", "allocator").strip().lower(),
             upstream_url=os.getenv("UPSTREAM_REALTIME_URL", "").strip(),
             upstream_session_url=os.getenv(
@@ -620,7 +627,7 @@ class RealtimeAdapterConnection:
                 for keyword in KEYWORD_GATE_WORDS
             ) or any(
                 transcript_head.startswith(prefix)
-                for prefix in KEYWORD_GATE_PREFIX_WORDS
+                for prefix in self.settings.keyword_gate_prefix_words
             )
             gate_active = now < self.keyword_gate_expires_at
             if not gate_active:
