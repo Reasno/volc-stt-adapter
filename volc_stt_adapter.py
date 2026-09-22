@@ -372,6 +372,7 @@ class VolcengineStream:
                                 continue
                             self.seen_utterances.add(key)
                             additions = utterance.get("additions")
+                            LOG.debug("[%s] utterance additions raw: %s | utterance keys: %s", self.item_id, additions, list(utterance.keys()))
                             speaker_id = None
                             if isinstance(additions, dict):
                                 raw_speaker_id = additions.get("speaker_id")
@@ -743,7 +744,7 @@ async def async_main() -> None:
 
 def main() -> None:
     logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        level=os.getenv("LOG_LEVEL", "DEBUG").upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     try:
