@@ -614,18 +614,13 @@ class RealtimeAdapterConnection:
                 keyword.lower().strip() in transcript_normalized
                 for keyword in KEYWORD_GATE_WORDS
             )
-            if has_keyword:
-                if (
-                    now < self.keyword_gate_expires_at
-                    and self.keyword_gate_speaker_id is not None
-                    and speaker_id is not None
-                    and speaker_id != self.keyword_gate_speaker_id
-                ):
-                    LOG.info(
-                        "Keyword gate binding replaced: previous=%s new=%s",
-                        self.keyword_gate_speaker_id,
-                        speaker_id,
-                    )
+            gate_active = now < self.keyword_gate_expires_at
+            if not gate_active:
+                self.keyword_gate_expires_at = 0.0
+                self.keyword_gate_speaker_id = None
+                if not has_keyword:
+                    LOG.info("Keyword gate suppressed transcript: wake window inactive")
+                    return
                 self.keyword_gate_expires_at = now + KEYWORD_GATE_WINDOW_S
                 self.keyword_gate_speaker_id = speaker_id
                 LOG.info(
@@ -633,10 +628,16 @@ class RealtimeAdapterConnection:
                     KEYWORD_GATE_WINDOW_S,
                     speaker_id,
                 )
-            elif now >= self.keyword_gate_expires_at:
-                self.keyword_gate_expires_at = 0.0
-                self.keyword_gate_speaker_id = None
-                LOG.info("Keyword gate suppressed transcript: wake window inactive")
+            elif (
+                speaker_id is not None
+                and self.keyword_gate_speaker_id is not None
+                and speaker_id != self.keyword_gate_speaker_id
+            ):
+                LOG.info(
+                    "Keyword gate ignored non-target speaker: target=%s speaker_id=%s",
+                    self.keyword_gate_speaker_id,
+                    speaker_id,
+                )
                 return
             else:
                 self.keyword_gate_expires_at = now + KEYWORD_GATE_WINDOW_S
