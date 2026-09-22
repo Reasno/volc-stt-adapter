@@ -254,11 +254,6 @@ class VolcengineStream:
         self.receiver: asyncio.Task[None] | None = None
         self.latest_text = ""
         self.last_emitted_text = ""
-        self.seen_utterances: set[tuple[Any, Any, str]] = set()
-        # Idempotency: dedup by unique utterance item_id so that upstream WS
-        # reconnect flushes (which re-emit historical items) don't get processed
-        # twice. Scoped to this stream; cleared implicitly on stream close.
-        self.seen_item_ids: set[str] = set()
         self.error: Exception | None = None
         self._closed = False
 
@@ -292,6 +287,7 @@ class VolcengineStream:
                 "enable_punc": True,
                 "enable_ddc": True,
                 "show_utterances": True,
+                "result_type": "single",
                 "enable_nonstream": True,
                 "enable_speaker_info": True,
             },
@@ -379,30 +375,6 @@ class VolcengineStream:
                             utterance_text = str(utterance.get("text") or "").strip()
                             if not utterance_text:
                                 continue
-                            key = (
-                                utterance.get("start_time"),
-                                utterance.get("end_time"),
-                                utterance_text,
-                            )
-                            if key in self.seen_utterances:
-                                continue
-                            self.seen_utterances.add(key)
-                            # Idempotency key: prefer the utterance's unique
-                            # item_id (Volcengine may re-flush historical items
-                            # on WS reconnect). Fall back to additions.item_id.
-                            item_id_raw: Any = utterance.get("item_id")
-                            if item_id_raw is None and isinstance(additions := utterance.get("additions"), dict):
-                                item_id_raw = additions.get("item_id")
-                            if item_id_raw is not None:
-                                item_id_key = str(item_id_raw)
-                                if item_id_key in self.seen_item_ids:
-                                    LOG.debug(
-                                        "[%s] dropping duplicate utterance item_id=%s",
-                                        self.item_id,
-                                        item_id_key,
-                                    )
-                                    continue
-                                self.seen_item_ids.add(item_id_key)
                             additions = utterance.get("additions")
                             LOG.debug("[%s] utterance additions raw: %s | utterance keys: %s", self.item_id, additions, list(utterance.keys()))
                             speaker_id = None
