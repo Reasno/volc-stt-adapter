@@ -37,7 +37,7 @@ NEG_WITH_SEQUENCE = 0x3
 SERIALIZATION_JSON = 0x1
 COMPRESSION_GZIP = 0x1
 
-KEYWORD_GATE_WORDS = ("reachy", "瑞奇", "瑞琪", "瑞吉")
+KEYWORD_GATE_WORDS = ("reachy", "瑞奇", "瑞琪", "瑞吉", "Richie", "Ricky", "Richey", "Riche")
 KEYWORD_GATE_WINDOW_S = 30.0
 
 
@@ -609,7 +609,10 @@ class RealtimeAdapterConnection:
 
         if self.settings.keyword_gate_enabled:
             now = time.time()
-            has_keyword = any(keyword in transcript.casefold() for keyword in KEYWORD_GATE_WORDS)
+            transcript_lower = transcript.lower()
+            has_keyword = any(
+                keyword.lower() in transcript_lower for keyword in KEYWORD_GATE_WORDS
+            )
             if has_keyword:
                 if (
                     now < self.keyword_gate_expires_at
