@@ -290,6 +290,15 @@ class VolcengineStream:
                 "result_type": "single",
                 "enable_nonstream": True,
                 "enable_speaker_info": True,
+                # ASR2.0 (Resource ID volc.seedasr.sauc.duration) + SSD 200
+                # 大模型 SSD 短对话聚类模式（<=5 人非会议场景）。ssd_mode=0
+                # 适用于 3 分钟以内短交互；ssd_version=200 是官方要求 speaker
+                # 分离必须搭配的字段，1.0 上不推荐、2.0 上才是推荐用法。
+                "ssd_version": "200",
+                "ssd_mode": 0,
+                # 缩短 VAD 判停（默认 800ms → 600ms），让分句更早切开，
+                # 减少跨说话人合并到同一 utterance 里而被聚成新 speaker_id。
+                "end_window_size": 600,
             },
         }
         if self.settings.boosting_table_id:
