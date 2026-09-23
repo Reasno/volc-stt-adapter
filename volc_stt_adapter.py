@@ -110,6 +110,7 @@ class Settings:
     kws_speaker_window_seconds: float
     kws_match_tolerance_ms: float
     kws_queue_frames: int
+    kws_text_fallback_words: tuple[str, ...]
     upstream_mode: str
     upstream_url: str
     upstream_session_url: str
@@ -178,6 +179,14 @@ class Settings:
         if sample_rate != SAMPLE_RATE:
             raise RuntimeError("AUDIO_SAMPLE_RATE must be 16000 when using this adapter")
         queue_frames = integer("KWS_QUEUE_FRAMES", "32", minimum=1)
+        text_fallback_raw = os.getenv(
+            "KWS_TEXT_FALLBACK_WORDS", "reachy,瑞奇,ricky"
+        )
+        text_fallback_words = tuple(
+            word.strip().lower()
+            for word in text_fallback_raw.split(",")
+            if word.strip()
+        )
 
         return cls(
             host=os.getenv("ADAPTER_HOST", "0.0.0.0"),
@@ -201,6 +210,7 @@ class Settings:
             kws_speaker_window_seconds=number("KWS_SPEAKER_WINDOW_SECONDS", "30", minimum=0.001),
             kws_match_tolerance_ms=number("KWS_MATCH_TOLERANCE_MS", "400", minimum=0.0),
             kws_queue_frames=queue_frames,
+            kws_text_fallback_words=text_fallback_words,
             upstream_mode=os.getenv("UPSTREAM_MODE", "allocator").strip().lower(),
             upstream_url=os.getenv("UPSTREAM_REALTIME_URL", "").strip(),
             upstream_session_url=os.getenv(
@@ -1128,13 +1138,57 @@ class RealtimeAdapterConnection:
                 self._stream_starting = False
                 self._pending_stream_audio.clear()
 
+    def _utterance_matches_wake_text(self, transcript: str) -> bool:
+        if not transcript:
+            return False
+        haystack = transcript.lower()
+        return any(word in haystack for word in self.settings.kws_text_fallback_words)
+
+    def _synthesize_wake_marker_from_utterance(
+        self, utterance: Utterance
+    ) -> WakeMarker | None:
+        # Prefer the utterance start (wake phrase typically leads the sentence);
+        # if the timeline is unavailable, fall back to end or 0 so the wake marker
+        # still exists and the gate can bind an identity via the missing-timeline
+        # path.
+        timestamp_ms = utterance.start_ms
+        if timestamp_ms is None:
+            timestamp_ms = utterance.end_ms
+        if timestamp_ms is None:
+            timestamp_ms = 0.0
+        sample_index = int(timestamp_ms * SAMPLE_RATE / 1000)
+        return WakeMarker(
+            stream_generation=utterance.stream_generation,
+            sample_index=sample_index,
+            timestamp_ms=float(timestamp_ms),
+        )
+
     async def _on_native_utterance(self, utterance: Utterance) -> None:
         transcript = utterance.text.strip()
         if not transcript:
             return
         decision = self.gate.decide(utterance)
+        text_fallback_triggered = False
+        if (
+            not decision.allow
+            and self.settings.kws_text_fallback_words
+            and self._utterance_matches_wake_text(transcript)
+        ):
+            marker = self._synthesize_wake_marker_from_utterance(utterance)
+            if marker is not None:
+                LOG.warning(
+                    "KWS audio detector missed wake phrase; text-fallback firing wake "
+                    "from ASR transcript: prior_reason=%s speaker_id=%s text=%s",
+                    decision.reason,
+                    utterance.speaker_id,
+                    transcript,
+                )
+                self.gate.on_wake(marker)
+                decision = self.gate.decide(utterance)
+                text_fallback_triggered = True
         LOG.info(
-            "KWS gate decision: mode=%s state=%s allow=%s enforce_allow=%s reason=%s generation=%d speaker_id=%s text=%s",
+            "KWS gate decision: mode=%s state=%s allow=%s enforce_allow=%s reason=%s "
+            "generation=%d speaker_id=%s text_fallback=%s text=%s",
             self.kws_mode.value,
             decision.state.value,
             decision.allow,
@@ -1142,6 +1196,7 @@ class RealtimeAdapterConnection:
             decision.reason,
             utterance.stream_generation,
             utterance.speaker_id,
+            text_fallback_triggered,
             transcript,
         )
         if decision.reason == "trigger_utterance_missing_timeline":
