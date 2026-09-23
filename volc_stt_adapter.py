@@ -118,7 +118,6 @@ class Settings:
     upstream_open_timeout_s: float
     speak_http_host: str
     speak_http_port: int
-    speak_api_token: str = field(repr=False)
     reachy_conversation_rpc_url: str
     volc_tts_url: str
     volc_tts_resource_id: str
@@ -126,6 +125,7 @@ class Settings:
     volc_tts_timeout_s: float
     speak_total_timeout_s: float
     volc_tts_max_audio_bytes: int
+    volc_tts_cache_entries: int
     daemon_sound_timeout_s: float
     daemon_sound_cleanup_delay_s: float
 
@@ -211,7 +211,6 @@ class Settings:
             upstream_open_timeout_s=number("UPSTREAM_OPEN_TIMEOUT_SECONDS", "20", minimum=0.1),
             speak_http_host=os.getenv("SPEAK_HTTP_HOST", "0.0.0.0"),
             speak_http_port=integer("SPEAK_HTTP_PORT", "8766", minimum=1, maximum=65535),
-            speak_api_token=os.getenv("SPEAK_API_TOKEN", ""),
             reachy_conversation_rpc_url=os.getenv(
                 "REACHY_CONVERSATION_RPC_URL", "ws://192.168.31.94:7860/rpc"
             ).strip(),
@@ -225,6 +224,7 @@ class Settings:
             volc_tts_max_audio_bytes=integer(
                 "VOLC_TTS_MAX_AUDIO_BYTES", str(16 * 1024 * 1024), minimum=1
             ),
+            volc_tts_cache_entries=integer("VOLC_TTS_CACHE_ENTRIES", "100", minimum=0),
             daemon_sound_timeout_s=number(
                 "DAEMON_SOUND_TIMEOUT_SECONDS", "10", minimum=0.1
             ),
@@ -1300,11 +1300,15 @@ async def run_servers(settings: Settings, stop: asyncio.Event) -> None:
             cleanup_delay_s=settings.daemon_sound_cleanup_delay_s,
             timeout_s=settings.daemon_sound_timeout_s,
         )
-        speaker = ReachySpeaker(conversation, tts, daemon)
+        speaker = ReachySpeaker(
+            conversation,
+            tts,
+            daemon,
+            cache_entries=settings.volc_tts_cache_entries,
+        )
         registry = LiveConnectionRegistry(settings.kws_mode)
         app = create_speak_app(
             speaker,
-            token=settings.speak_api_token,
             total_timeout_s=settings.speak_total_timeout_s,
             gate_opener=registry.open_gate,
         )

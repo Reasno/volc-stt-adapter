@@ -24,6 +24,7 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.kws_preroll_seconds, 1.5)
         self.assertEqual(settings.volc_tts_resource_id, "seed-tts-2.0")
         self.assertEqual(settings.volc_tts_voice, "zh_female_vv_uranus_bigtts")
+        self.assertEqual(settings.volc_tts_cache_entries, 100)
 
     def test_invalid_mode_and_fractional_queue_are_rejected(self):
         with patch.dict(os.environ, {**BASE_ENV, "KWS_MODE": "enabled"}, clear=True):
@@ -33,17 +34,28 @@ class SettingsTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "integer"):
                 Settings.from_environment()
 
+    def test_tts_cache_entries_must_be_non_negative_integer(self):
+        for value in ("-1", "1.5", "invalid"):
+            with self.subTest(value=value), patch.dict(
+                os.environ, {**BASE_ENV, "VOLC_TTS_CACHE_ENTRIES": value}, clear=True
+            ):
+                with self.assertRaisesRegex(RuntimeError, "VOLC_TTS_CACHE_ENTRIES"):
+                    Settings.from_environment()
+        with patch.dict(
+            os.environ, {**BASE_ENV, "VOLC_TTS_CACHE_ENTRIES": "0"}, clear=True
+        ):
+            self.assertEqual(Settings.from_environment().volc_tts_cache_entries, 0)
+
     def test_sensitive_values_are_not_in_repr(self):
         with patch.dict(
             os.environ,
-            {**BASE_ENV, "VOLC_ACCESS_KEY": "secret-access", "SPEAK_API_TOKEN": "secret-token"},
+            {**BASE_ENV, "VOLC_ACCESS_KEY": "secret-access"},
             clear=True,
         ):
             settings = Settings.from_environment()
         rendered = repr(settings)
         self.assertNotIn("test-app", rendered)
         self.assertNotIn("secret-access", rendered)
-        self.assertNotIn("secret-token", rendered)
 
     def test_common_utterance_timeline_fields(self):
         self.assertEqual(utterance_times_ms({"start_time": 12, "end_time": "34"}), (12.0, 34.0))

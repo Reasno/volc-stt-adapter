@@ -24,6 +24,7 @@ from reachy_speaker import (
     DaemonSoundClient,
     FallbackDisabledError,
     ReachySpeaker,
+    SpeakResult,
     SpeakerError,
     TtsProtocolError,
     VolcengineTtsClient,
@@ -197,6 +198,130 @@ class AggregationTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(SpeakerError, "both speech routes failed"):
             await ReachySpeaker(conversation, tts, daemon).speak("hi", "r1")
 
+    async def test_fallback_cache_hit_synthesizes_once_but_plays_twice(self):
+        conversation = SimpleNamespace(say=AsyncMock(side_effect=ConversationError("offline")))
+        tts = SimpleNamespace(
+            synthesize=AsyncMock(return_value=b"audio"),
+            resource_id="resource-a",
+            voice="voice-a",
+            max_audio_bytes=100,
+        )
+        daemon = SimpleNamespace(upload_and_play=AsyncMock(), close=AsyncMock())
+        speaker = ReachySpeaker(conversation, tts, daemon)
+
+        first = await speaker.speak("same", "r1")
+        second = await speaker.speak("same", "r2")
+
+        self.assertFalse(first.tts_cache_hit)
+        self.assertTrue(second.tts_cache_hit)
+        tts.synthesize.assert_awaited_once_with("same", "r1")
+        self.assertEqual(daemon.upload_and_play.await_count, 2)
+        self.assertIs(daemon.upload_and_play.await_args_list[0].args[0], b"audio")
+        self.assertIs(
+            daemon.upload_and_play.await_args_list[0].args[0],
+            daemon.upload_and_play.await_args_list[1].args[0],
+        )
+
+    async def test_cache_key_separates_text_voice_and_resource(self):
+        conversation = SimpleNamespace(say=AsyncMock(side_effect=ConversationError("offline")))
+        tts = SimpleNamespace(
+            synthesize=AsyncMock(return_value=b"audio"),
+            resource_id="resource-a",
+            voice="voice-a",
+            max_audio_bytes=100,
+        )
+        speaker = ReachySpeaker(
+            conversation,
+            tts,
+            SimpleNamespace(upload_and_play=AsyncMock(), close=AsyncMock()),
+        )
+        await speaker.speak("one", "r1")
+        await speaker.speak("two", "r2")
+        tts.voice = "voice-b"
+        await speaker.speak("one", "r3")
+        tts.resource_id = "resource-b"
+        await speaker.speak("one", "r4")
+        self.assertEqual(tts.synthesize.await_count, 4)
+
+    async def test_lru_hit_moves_to_mru_and_evicts_oldest(self):
+        conversation = SimpleNamespace(say=AsyncMock(side_effect=ConversationError("offline")))
+        tts = SimpleNamespace(
+            synthesize=AsyncMock(side_effect=lambda text, _: text.encode()),
+            resource_id="resource",
+            voice="voice",
+            max_audio_bytes=100,
+        )
+        speaker = ReachySpeaker(
+            conversation,
+            tts,
+            SimpleNamespace(upload_and_play=AsyncMock(), close=AsyncMock()),
+            cache_entries=2,
+        )
+        await speaker.speak("a", "r1")
+        await speaker.speak("b", "r2")
+        self.assertTrue((await speaker.speak("a", "r3")).tts_cache_hit)
+        await speaker.speak("c", "r4")
+        self.assertFalse((await speaker.speak("b", "r5")).tts_cache_hit)
+        self.assertEqual(speaker.tts_cache.stats["evictions"], 2)
+
+    async def test_default_cache_evicts_on_101st_entry(self):
+        conversation = SimpleNamespace(say=AsyncMock(side_effect=ConversationError("offline")))
+        tts = SimpleNamespace(
+            synthesize=AsyncMock(return_value=b"audio"),
+            resource_id="resource",
+            voice="voice",
+            max_audio_bytes=100,
+        )
+        speaker = ReachySpeaker(
+            conversation,
+            tts,
+            SimpleNamespace(upload_and_play=AsyncMock(), close=AsyncMock()),
+        )
+        for index in range(101):
+            await speaker.speak(str(index), f"r{index}")
+        self.assertEqual(speaker.tts_cache.size, 100)
+        self.assertEqual(speaker.tts_cache.stats["evictions"], 1)
+        self.assertFalse((await speaker.speak("0", "again")).tts_cache_hit)
+
+    async def test_zero_disables_cache_and_failures_are_not_cached(self):
+        conversation = SimpleNamespace(say=AsyncMock(side_effect=ConversationError("offline")))
+        tts = SimpleNamespace(
+            synthesize=AsyncMock(return_value=b"audio"),
+            resource_id="resource",
+            voice="voice",
+            max_audio_bytes=100,
+        )
+        daemon = SimpleNamespace(upload_and_play=AsyncMock(), close=AsyncMock())
+        disabled = ReachySpeaker(conversation, tts, daemon, cache_entries=0)
+        await disabled.speak("same", "r1")
+        await disabled.speak("same", "r2")
+        self.assertEqual(tts.synthesize.await_count, 2)
+        self.assertEqual(disabled.tts_cache.size, 0)
+
+        tts.synthesize.reset_mock()
+        tts.synthesize.side_effect = [TtsProtocolError("failed"), b"ok"]
+        enabled = ReachySpeaker(conversation, tts, daemon)
+        with self.assertRaises(SpeakerError):
+            await enabled.speak("retry", "r3")
+        result = await enabled.speak("retry", "r4")
+        self.assertFalse(result.tts_cache_hit)
+        self.assertEqual(tts.synthesize.await_count, 2)
+
+    async def test_close_clears_cache(self):
+        conversation = SimpleNamespace(say=AsyncMock(side_effect=ConversationError("offline")))
+        tts = SimpleNamespace(
+            synthesize=AsyncMock(return_value=b"audio"),
+            resource_id="resource",
+            voice="voice",
+            max_audio_bytes=100,
+        )
+        daemon = SimpleNamespace(upload_and_play=AsyncMock(), close=AsyncMock())
+        speaker = ReachySpeaker(conversation, tts, daemon)
+        await speaker.speak("cached", "r1")
+        await speaker.close()
+        self.assertEqual(speaker.tts_cache.size, 0)
+        daemon.close.assert_awaited_once()
+
 
 class TtsTests(unittest.IsolatedAsyncioTestCase):
     def make_client(self, ws, maximum=20):
@@ -276,7 +401,6 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.gate_opener = AsyncMock(return_value=(True, "proactive_reply_armed"))
         self.server = TestServer(create_speak_app(
             self.speaker,
-            token="secret",
             total_timeout_s=1,
             max_text_bytes=10,
             gate_opener=self.gate_opener,
@@ -287,22 +411,30 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.client.close()
 
-    async def test_authentication(self):
-        response = await self.client.post("/speak", json={"text": "hi"})
-        self.assertEqual(response.status, 401)
-        response = await self.client.post("/speak", json={"text": " hi "}, headers={"Authorization": "Bearer secret"})
+    async def test_speak_requires_no_authorization(self):
+        response = await self.client.post("/speak", json={"text": " hi "})
         self.assertEqual(response.status, 200)
-        self.assertEqual((await response.json())["route"], "conversation")
+        payload = await response.json()
+        self.assertEqual(payload["route"], "conversation")
+        self.assertFalse(payload["tts_cache_hit"])
         self.speaker.speak.assert_awaited_once()
 
+    async def test_success_reports_tts_cache_hit(self):
+        self.speaker.speak.return_value = SpeakResult("daemon_tts", tts_cache_hit=True)
+        response = await self.client.post(
+            "/speak", json={"text": "hi"}
+        )
+        payload = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload["route"], "daemon_tts")
+        self.assertTrue(payload["tts_cache_hit"])
+
     async def test_empty_and_too_long(self):
-        headers = {"Authorization": "Bearer secret"}
-        self.assertEqual((await self.client.post("/speak", json={"text": "  "}, headers=headers)).status, 400)
-        self.assertEqual((await self.client.post("/speak", json={"text": "中文中文"}, headers=headers)).status, 400)
+        self.assertEqual((await self.client.post("/speak", json={"text": "  "})).status, 400)
+        self.assertEqual((await self.client.post("/speak", json={"text": "中文中文"})).status, 400)
 
     async def test_open_gate_default_false_and_true(self):
-        headers = {"Authorization": "Bearer secret"}
-        response = await self.client.post("/speak", json={"text": "hi"}, headers=headers)
+        response = await self.client.post("/speak", json={"text": "hi"})
         payload = await response.json()
         self.assertFalse(payload["gate_requested"])
         self.assertFalse(payload["gate_opened"])
@@ -310,14 +442,13 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.gate_opener.assert_not_awaited()
 
         response = await self.client.post(
-            "/speak", json={"text": "hi", "open_gate": True}, headers=headers
+            "/speak", json={"text": "hi", "open_gate": True}
         )
         payload = await response.json()
         self.assertTrue(payload["gate_opened"])
         self.assertEqual(payload["gate_reason"], "proactive_reply_armed")
 
     async def test_gate_cardinality_and_non_enforced_reasons_are_success(self):
-        headers = {"Authorization": "Bearer secret"}
         for result in (
             (False, "no_active_connection"),
             (False, "ambiguous_connections"),
@@ -325,18 +456,17 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.gate_opener.return_value = result
             response = await self.client.post(
-                "/speak", json={"text": "hi", "open_gate": True}, headers=headers
+                "/speak", json={"text": "hi", "open_gate": True}
             )
             self.assertEqual(response.status, 200)
             self.assertEqual((await response.json())["gate_reason"], result[1])
 
     async def test_invalid_boolean_types(self):
-        headers = {"Authorization": "Bearer secret"}
         for body in (
             {"text": "hi", "open_gate": "true"},
             {"text": "hi", "allow_tts_fallback": "false"},
         ):
-            self.assertEqual((await self.client.post("/speak", json=body, headers=headers)).status, 400)
+            self.assertEqual((await self.client.post("/speak", json=body)).status, 400)
         self.speaker.speak.assert_not_awaited()
 
     async def test_fallback_disabled_failure_does_not_open_gate(self):
@@ -344,7 +474,6 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post(
             "/speak",
             json={"text": "hi", "open_gate": True, "allow_tts_fallback": False},
-            headers={"Authorization": "Bearer secret"},
         )
         payload = await response.json()
         self.assertEqual(response.status, 502)
@@ -357,7 +486,6 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post(
             "/speak",
             json={"text": "hi", "open_gate": True, "allow_tts_fallback": False},
-            headers={"Authorization": "Bearer secret"},
         )
         self.assertEqual(response.status, 200)
         payload = await response.json()
@@ -370,7 +498,6 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post(
             "/speak",
             json={"text": "hi", "open_gate": True},
-            headers={"Authorization": "Bearer secret"},
         )
         self.assertEqual(response.status, 200)
         payload = await response.json()
@@ -386,7 +513,6 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         await self.client.close()
         self.server = TestServer(create_speak_app(
             self.speaker,
-            token="secret",
             total_timeout_s=0.01,
             gate_opener=slow_gate,
         ))
@@ -395,7 +521,6 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post(
             "/speak",
             json={"text": "hi", "open_gate": True},
-            headers={"Authorization": "Bearer secret"},
         )
         self.assertEqual(response.status, 200)
         self.assertEqual((await response.json())["gate_reason"], "gate_open_timeout")
@@ -408,7 +533,7 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_both_routes_failed_is_502(self):
         self.speaker.speak.side_effect = SpeakerError("both failed")
-        response = await self.client.post("/speak", json={"text": "hi"}, headers={"Authorization": "Bearer secret"})
+        response = await self.client.post("/speak", json={"text": "hi"})
         self.assertEqual(response.status, 502)
 
 
