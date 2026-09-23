@@ -43,13 +43,14 @@ def append_message(pcm):
     }
 
 
-def settings(mode, text_fallback_words=("reachy", "瑞奇", "ricky")):
+def settings(mode):
     return SimpleNamespace(
         kws_mode=GateMode(mode),
         kws_trigger_timeout_seconds=3,
         kws_speaker_window_seconds=30,
         kws_match_tolerance_ms=100,
-        kws_text_fallback_words=text_fallback_words,
+        keyword_gate_enabled=True,
+        keyword_gate_prefix_words=(),
     )
 
 
@@ -61,7 +62,7 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         connection._on_stream_generation(7, 0)
         connection.gate.on_wake(WakeMarker(7, 16000, 1000))
         await connection._on_native_utterance(
-            Utterance("请打开客厅灯", "speaker-a", 7, 850, 1400)
+            Utterance("瑞奇 请打开客厅灯", "speaker-a", 7, 850, 1400)
         )
         self.assertEqual(
             [message["type"] for message in downstream.messages],
@@ -72,9 +73,11 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
                 "conversation.item.input_audio_transcription.completed",
             ],
         )
-        self.assertEqual(downstream.messages[1]["delta"], "请打开客厅灯")
-        self.assertEqual(downstream.messages[3]["transcript"], "请打开客厅灯")
-        self.assertEqual(upstream.messages[0]["item"]["content"][0]["text"], "请打开客厅灯")
+        self.assertEqual(downstream.messages[1]["delta"], "瑞奇 请打开客厅灯")
+        self.assertEqual(downstream.messages[3]["transcript"], "瑞奇 请打开客厅灯")
+        self.assertEqual(
+            upstream.messages[0]["item"]["content"][0]["text"], "瑞奇 请打开客厅灯"
+        )
         self.assertEqual(upstream.messages[1]["type"], "response.create")
 
     async def test_append_during_blocked_drain_is_sent_in_next_round(self):
@@ -187,77 +190,9 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         upstream = Sink(); connection.upstream = upstream
         connection._on_stream_generation(2, 0)
         connection.gate.on_wake(WakeMarker(2, 16000, 1000))
-        await connection._on_native_utterance(Utterance("唤醒首句", "alice", 2, 900, 1300))
+        await connection._on_native_utterance(Utterance("瑞奇 唤醒首句", "alice", 2, 900, 1300))
         downstream.messages.clear(); upstream.messages.clear()
         await connection._on_native_utterance(Utterance("不应注入的文本", "bob", 2, 1400, 1800))
-        self.assertEqual(downstream.messages, [])
-        self.assertEqual(upstream.messages, [])
-
-    async def test_text_fallback_wake_when_kws_missed(self):
-        # Gate never sees a KWS wake event (audio detector missed), but the ASR
-        # transcript contains "瑞奇". The text-fallback must fire a synthesized
-        # wake so the utterance is admitted and the speaker is bound for the
-        # rest of the window.
-        downstream = Sink()
-        connection = RealtimeAdapterConnection(downstream, settings("enforce"))
-        upstream = Sink(); connection.upstream = upstream
-        connection._on_stream_generation(3, 0)
-        # No on_wake() call — simulates KWS miss.
-        await connection._on_native_utterance(
-            Utterance("瑞奇，打开客厅的灯", "alice", 3, 900, 1400)
-        )
-        self.assertEqual(
-            [m["type"] for m in downstream.messages],
-            [
-                "input_audio_buffer.speech_started",
-                "conversation.item.input_audio_transcription.delta",
-                "input_audio_buffer.speech_stopped",
-                "conversation.item.input_audio_transcription.completed",
-            ],
-        )
-        self.assertEqual(upstream.messages[0]["item"]["content"][0]["text"], "瑞奇，打开客厅的灯")
-        # Same speaker follow-up within window is still admitted.
-        downstream.messages.clear(); upstream.messages.clear()
-        await connection._on_native_utterance(
-            Utterance("再关掉次卧的灯", "alice", 3, 1500, 1900)
-        )
-        self.assertTrue(any(m["type"] == "conversation.item.create" for m in upstream.messages))
-        # Different speaker without wake word is still blocked.
-        downstream.messages.clear(); upstream.messages.clear()
-        await connection._on_native_utterance(
-            Utterance("这不该被注入", "bob", 3, 1950, 2400)
-        )
-        self.assertEqual(upstream.messages, [])
-
-    async def test_text_fallback_wake_interrupts_active_response(self):
-        # Reachy is speaking (upstream_response_active=True) and the audio KWS
-        # missed the barge-in. When the ASR transcript later matches a wake
-        # phrase, the fallback must fire a wake, allow the utterance, and
-        # cancel the in-flight response so barge-in works.
-        downstream = Sink()
-        connection = RealtimeAdapterConnection(downstream, settings("enforce"))
-        upstream = Sink(); connection.upstream = upstream
-        connection._on_stream_generation(4, 0)
-        connection.upstream_response_active = True
-        await connection._on_native_utterance(
-            Utterance("Reachy 停一下", "alice", 4, 500, 950)
-        )
-        cancel_events = [m for m in upstream.messages if m.get("type") == "response.cancel"]
-        self.assertEqual(len(cancel_events), 1)
-        self.assertFalse(connection.upstream_response_active)
-
-    async def test_text_fallback_disabled_via_empty_config(self):
-        downstream = Sink()
-        connection = RealtimeAdapterConnection(
-            downstream, settings("enforce", text_fallback_words=())
-        )
-        upstream = Sink(); connection.upstream = upstream
-        connection._on_stream_generation(5, 0)
-        # Even though the transcript contains "瑞奇", no wake was received
-        # and the fallback is disabled, so the utterance must be dropped.
-        await connection._on_native_utterance(
-            Utterance("瑞奇你在吗", "alice", 5, 900, 1200)
-        )
         self.assertEqual(downstream.messages, [])
         self.assertEqual(upstream.messages, [])
 

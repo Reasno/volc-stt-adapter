@@ -39,6 +39,23 @@ from websockets.exceptions import ConnectionClosed
 
 LOG = logging.getLogger("volc_stt_adapter")
 
+# Post-stream text gate: after the KWS opens the Volcengine stream, per-utterance
+# admission runs on the ASR transcript, not on KWS/AudioGate. If a speaker
+# says one of these words (case-insensitive substring), they get a fresh
+# KEYWORD_GATE_WINDOW_S seconds during which every subsequent utterance from
+# the same speaker_id is admitted and refreshes the window.
+KEYWORD_GATE_WORDS = (
+    "reachy", "瑞奇", "瑞琪", "瑞吉",
+    "richie", "ricky", "richey", "riche", "reach",
+)
+# Prefix wake words: only count when they appear at the utterance head. A stray
+# occurrence in the middle must not open the gate. Override via
+# VOLC_GATE_PREFIX_WORDS (comma-separated).
+DEFAULT_KEYWORD_GATE_PREFIX_WORDS = (
+    "语音", "微信", "一起", "云溪", "微启", "允许", "机器", "运气",
+)
+KEYWORD_GATE_WINDOW_S = 30.0
+
 # Volcengine binary protocol constants.
 CLIENT_FULL_REQUEST = 0x1
 CLIENT_AUDIO_ONLY_REQUEST = 0x2
@@ -110,7 +127,6 @@ class Settings:
     kws_speaker_window_seconds: float
     kws_match_tolerance_ms: float
     kws_queue_frames: int
-    kws_text_fallback_words: tuple[str, ...]
     upstream_mode: str
     upstream_url: str
     upstream_session_url: str
@@ -130,6 +146,8 @@ class Settings:
     volc_tts_cache_dir: str
     daemon_sound_timeout_s: float
     daemon_sound_cleanup_delay_s: float
+    keyword_gate_enabled: bool
+    keyword_gate_prefix_words: tuple[str, ...]
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -179,13 +197,16 @@ class Settings:
         if sample_rate != SAMPLE_RATE:
             raise RuntimeError("AUDIO_SAMPLE_RATE must be 16000 when using this adapter")
         queue_frames = integer("KWS_QUEUE_FRAMES", "32", minimum=1)
-        text_fallback_raw = os.getenv(
-            "KWS_TEXT_FALLBACK_WORDS", "reachy,瑞奇,ricky"
-        )
-        text_fallback_words = tuple(
-            word.strip().lower()
-            for word in text_fallback_raw.split(",")
-            if word.strip()
+
+        prefix_words_raw = os.getenv("VOLC_GATE_PREFIX_WORDS", "").replace("，", ",")
+        keyword_gate_prefix_words: tuple[str, ...] = tuple(
+            word.strip() for word in prefix_words_raw.split(",") if word.strip()
+        ) or DEFAULT_KEYWORD_GATE_PREFIX_WORDS
+        keyword_gate_enabled = os.getenv("KEYWORD_GATE_ENABLED", "true").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
         )
 
         return cls(
@@ -210,7 +231,6 @@ class Settings:
             kws_speaker_window_seconds=number("KWS_SPEAKER_WINDOW_SECONDS", "30", minimum=0.001),
             kws_match_tolerance_ms=number("KWS_MATCH_TOLERANCE_MS", "400", minimum=0.0),
             kws_queue_frames=queue_frames,
-            kws_text_fallback_words=text_fallback_words,
             upstream_mode=os.getenv("UPSTREAM_MODE", "allocator").strip().lower(),
             upstream_url=os.getenv("UPSTREAM_REALTIME_URL", "").strip(),
             upstream_session_url=os.getenv(
@@ -243,6 +263,8 @@ class Settings:
             daemon_sound_cleanup_delay_s=number(
                 "DAEMON_SOUND_CLEANUP_DELAY_SECONDS", "300", minimum=0.0
             ),
+            keyword_gate_enabled=keyword_gate_enabled,
+            keyword_gate_prefix_words=keyword_gate_prefix_words,
         )
 
 
@@ -743,6 +765,20 @@ class RealtimeAdapterConnection:
         )
         self.detector: WakeWordDetector | None = None
         self._pending_wake: WakeEvent | None = None
+        # Post-stream text gate state: per-speaker window that admits every
+        # utterance from that speaker for KEYWORD_GATE_WINDOW_S after the last
+        # matching keyword. Values are monotonic-clock expiry deadlines.
+        self._keyword_gate_speakers: dict[str, float] = {}
+        # After a proactive TTS reply ends, the next utterance from any speaker
+        # is admitted once (without a keyword) and opens their normal window.
+        # Monotonic-clock deadline (0.0 = disarmed).
+        self._keyword_gate_wildcard_deadline: float = 0.0
+        # Soft-close watchdog: closes the Volcengine stream as soon as no
+        # speaker window in _keyword_gate_speakers is still active. On stream
+        # start we grant an initial grace period (KEYWORD_GATE_WINDOW_S) so the
+        # very first utterance after the KWS wake has time to arrive.
+        self._stream_watchdog_task: asyncio.Task | None = None
+        self._stream_watchdog_grace_deadline: float = 0.0
         self._stream_starting = False
         self._pending_stream_audio = bytearray()
         self._pending_stream_audio_lock = asyncio.Lock()
@@ -1011,6 +1047,7 @@ class RealtimeAdapterConnection:
             # close again after start returns. The close lock serializes overlap.
             await self._close_stream_safely(starting_stream)
             return
+        self._arm_stream_idle()
         LOG.info(
             "[%s] Volcengine stream started: generation=%d origin_sample=%d mode=%s",
             starting_stream.item_id,
@@ -1096,12 +1133,15 @@ class RealtimeAdapterConnection:
                 self._pending_stream_audio.clear()
 
     async def arm_gate_for_reply(self) -> bool:
-        """Open the enforced gate after proactive speech has fully completed."""
+        """Open the gate for a proactive-reply: admit the next utterance
+        (from any speaker) without requiring a wake keyword, and start their
+        normal 30s window."""
         if self.kws_mode is not GateMode.ENFORCE or self._closed:
             return False
         async with self._lifecycle_lock:
             lifecycle_generation = self._lifecycle_generation
             if self.stream is not None:
+                self._keyword_gate_wildcard_deadline = time.monotonic() + KEYWORD_GATE_WINDOW_S
                 return self.gate.arm_for_reply(self.stream.generation)
             async with self._pending_stream_audio_lock:
                 self._stream_starting = True
@@ -1129,6 +1169,9 @@ class RealtimeAdapterConnection:
                             buffered = bytes(self._pending_stream_audio)
                             self._pending_stream_audio.clear()
                         await self.stream.send_audio(buffered)
+                    self._keyword_gate_wildcard_deadline = (
+                        time.monotonic() + KEYWORD_GATE_WINDOW_S
+                    )
                     return self.gate.arm_for_reply(self.stream.generation)
             if stale_stream is not None:
                 await self._close_stream_safely(stale_stream)
@@ -1138,84 +1181,30 @@ class RealtimeAdapterConnection:
                 self._stream_starting = False
                 self._pending_stream_audio.clear()
 
-    def _utterance_matches_wake_text(self, transcript: str) -> bool:
-        if not transcript:
-            return False
-        haystack = transcript.lower()
-        return any(word in haystack for word in self.settings.kws_text_fallback_words)
-
-    def _synthesize_wake_marker_from_utterance(
-        self, utterance: Utterance
-    ) -> WakeMarker | None:
-        # Prefer the utterance start (wake phrase typically leads the sentence);
-        # if the timeline is unavailable, fall back to end or 0 so the wake marker
-        # still exists and the gate can bind an identity via the missing-timeline
-        # path.
-        timestamp_ms = utterance.start_ms
-        if timestamp_ms is None:
-            timestamp_ms = utterance.end_ms
-        if timestamp_ms is None:
-            timestamp_ms = 0.0
-        sample_index = int(timestamp_ms * SAMPLE_RATE / 1000)
-        return WakeMarker(
-            stream_generation=utterance.stream_generation,
-            sample_index=sample_index,
-            timestamp_ms=float(timestamp_ms),
-        )
-
     async def _on_native_utterance(self, utterance: Utterance) -> None:
         transcript = utterance.text.strip()
         if not transcript:
             return
-        decision = self.gate.decide(utterance)
-        text_fallback_triggered = False
-        if (
-            not decision.allow
-            and self.settings.kws_text_fallback_words
-            and self._utterance_matches_wake_text(transcript)
-        ):
-            marker = self._synthesize_wake_marker_from_utterance(utterance)
-            if marker is not None:
-                LOG.warning(
-                    "KWS audio detector missed wake phrase; text-fallback firing wake "
-                    "from ASR transcript: prior_reason=%s speaker_id=%s text=%s",
-                    decision.reason,
-                    utterance.speaker_id,
-                    transcript,
-                )
-                self.gate.on_wake(marker)
-                decision = self.gate.decide(utterance)
-                text_fallback_triggered = True
+
+        # Post-stream admission is decided by the ASR transcript, not by the
+        # KWS gate. KWS only opened the stream; from here on every keep-alive /
+        # continuation of the conversation must be justified by what the ASR
+        # actually heard, so background chatter cannot keep the upstream
+        # subscription (and its billing) alive.
+        if self.settings.keyword_gate_enabled:
+            admit_reason = self._decide_text_gate(transcript, utterance.speaker_id)
+            if admit_reason is None:
+                return
+        else:
+            admit_reason = "gate_disabled"
+
         LOG.info(
-            "KWS gate decision: mode=%s state=%s allow=%s enforce_allow=%s reason=%s "
-            "generation=%d speaker_id=%s text_fallback=%s text=%s",
-            self.kws_mode.value,
-            decision.state.value,
-            decision.allow,
-            decision.enforce_allow,
-            decision.reason,
-            utterance.stream_generation,
+            "Text gate admit: reason=%s speaker_id=%s active=%s text=%s",
+            admit_reason,
             utterance.speaker_id,
-            text_fallback_triggered,
+            sorted(self._keyword_gate_speakers.keys()),
             transcript,
         )
-        if decision.reason == "trigger_utterance_missing_timeline":
-            LOG.warning(
-                "Wake-matched first definite utterance has no usable timeline; "
-                "binding speaker %s by fallback without timeline verification",
-                utterance.speaker_id,
-            )
-        elif decision.reason == "trigger_utterance_missing_timeline_and_speaker":
-            LOG.warning(
-                "Wake-matched first definite utterance has neither timeline nor speaker; "
-                "allowing once without speaker authorization"
-            )
-        elif decision.reason == "trigger_utterance_missing_speaker":
-            LOG.warning(
-                "Wake-matched first definite utterance has no speaker; allowing once without speaker authorization"
-            )
-        if not decision.allow:
-            return
 
         item_id = f"item_{uuid.uuid4().hex}"
         if self.upstream_response_active:
@@ -1256,6 +1245,104 @@ class RealtimeAdapterConnection:
         )
         LOG.info("[%s] native VAD transcript injected upstream: %s", item_id, transcript)
 
+    def _decide_text_gate(self, transcript: str, speaker_id: str | None) -> str | None:
+        """Return an admission reason string, or None to drop the utterance."""
+        now = time.monotonic()
+
+        # Prune expired speaker windows first so log output stays truthful.
+        expired = [sid for sid, exp in self._keyword_gate_speakers.items() if exp <= now]
+        for sid in expired:
+            LOG.info("Text gate window expired: speaker_id=%s", sid)
+            self._keyword_gate_speakers.pop(sid, None)
+
+        transcript_normalized = transcript.lower().strip()
+        transcript_head = transcript_normalized.lstrip("，。！？、,.!?~ ")
+        has_keyword = any(
+            keyword.lower().strip() in transcript_normalized
+            for keyword in KEYWORD_GATE_WORDS
+        ) or any(
+            transcript_head.startswith(prefix)
+            for prefix in self.settings.keyword_gate_prefix_words
+        )
+
+        speaker_key = speaker_id if speaker_id is not None else "__unknown__"
+
+        if has_keyword:
+            new_activation = speaker_key not in self._keyword_gate_speakers
+            self._keyword_gate_speakers[speaker_key] = now + KEYWORD_GATE_WINDOW_S
+            return "keyword_opened" if new_activation else "keyword_refreshed"
+
+        if speaker_key in self._keyword_gate_speakers:
+            # Active speaker keeps talking within their own window.
+            self._keyword_gate_speakers[speaker_key] = now + KEYWORD_GATE_WINDOW_S
+            return "speaker_window"
+
+        if self._keyword_gate_wildcard_deadline > now:
+            # Proactive-reply wildcard: admit the very next utterance from
+            # anyone and open their normal keyword window.
+            self._keyword_gate_wildcard_deadline = 0.0
+            self._keyword_gate_speakers[speaker_key] = now + KEYWORD_GATE_WINDOW_S
+            return "proactive_reply_wildcard"
+
+        LOG.info(
+            "Text gate suppressed: speaker_id=%s not in active set %s text=%s",
+            speaker_id,
+            sorted(self._keyword_gate_speakers.keys()),
+            transcript,
+        )
+        return None
+
+    def _arm_stream_idle(self) -> None:
+        """Start the soft-close watchdog for a freshly published stream."""
+        # Give the newly opened stream a grace window so the first-ever
+        # utterance after the KWS wake (which is what created this stream) has
+        # a chance to arrive and open a speaker window.
+        self._stream_watchdog_grace_deadline = time.monotonic() + KEYWORD_GATE_WINDOW_S
+        task = self._stream_watchdog_task
+        if task is not None and not task.done():
+            return
+        self._stream_watchdog_task = asyncio.create_task(
+            self._stream_idle_watchdog(), name="volc-stream-idle-watchdog"
+        )
+
+    def _next_active_speaker_deadline(self) -> float:
+        """Return the latest speaker-window expiry, or 0.0 if none is active."""
+        if not self._keyword_gate_speakers:
+            return 0.0
+        return max(self._keyword_gate_speakers.values())
+
+    async def _stream_idle_watchdog(self) -> None:
+        try:
+            while True:
+                now = time.monotonic()
+                speaker_deadline = self._next_active_speaker_deadline()
+                grace_deadline = self._stream_watchdog_grace_deadline
+                # "Active speaker exists" == some speaker window not yet expired.
+                # While inside the initial grace, treat that grace as an active
+                # window so the first-ever utterance has time to arrive.
+                deadline = max(speaker_deadline, grace_deadline)
+                if deadline <= now:
+                    break
+                await asyncio.sleep(deadline - now)
+            if self._closed or self.stream is None:
+                return
+            LOG.info(
+                "No active speaker window (grace expired, keyword_gate empty); "
+                "soft-closing Volcengine stream"
+            )
+            await self.clear_audio(emit_confirmation=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.exception("Stream idle watchdog failed")
+
+    def _cancel_stream_idle(self) -> None:
+        self._stream_watchdog_grace_deadline = 0.0
+        task = self._stream_watchdog_task
+        self._stream_watchdog_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
     async def clear_audio(self, *, emit_confirmation: bool = True) -> None:
         async with self._lifecycle_lock:
             async with self._stream_lock:
@@ -1271,6 +1358,9 @@ class RealtimeAdapterConnection:
                 self._stream_starting = False
                 self._pending_stream_audio.clear()
             self.gate.clear()
+            self._keyword_gate_speakers.clear()
+            self._keyword_gate_wildcard_deadline = 0.0
+            self._cancel_stream_idle()
             if self.detector:
                 await self.detector.reset()
         # Never hold lifecycle/stream locks while close waits on receiver/ws.
