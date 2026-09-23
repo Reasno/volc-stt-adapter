@@ -87,3 +87,66 @@ Reachy 社区唤醒模型来自 `andyjmorgan/reachy-wake-word`，采用 **CC BY-
 - 火山继续使用 `bigmodel_async`、原生 VAD、SSD speaker 信息和既有 transient reconnect。
 - `LOG_LEVEL=DEBUG` 可查看原始火山结果；INFO 可查看 KWS 与 gate decision。
 - 服务默认无客户端认证，仅建议可信 LAN；跨网络应增加 TLS 与鉴权。
+
+## 主动播报 HTTP API
+
+服务在 STT WebSocket 同一进程中另启 HTTP 监听（默认 `0.0.0.0:8766`）：
+
+- `GET /health`：只报告 adapter HTTP 服务存活，不访问 Reachy、火山或 daemon。
+- `POST /speak`：JSON 为 `{"text":"要播报的文本"}`；文本 trim 后不能为空，UTF-8 编码不超过 4000 字节。
+- 成功返回 `{"ok":true,"route":"conversation|daemon_tts","request_id":"..."}`。
+- 输入错误返回 400；鉴权失败返回 401；conversation 与 TTS/daemon 两条路径均失败或总超时返回 502。
+
+请求由进程内 `asyncio.Lock` 串行，且受 `SPEAK_TOTAL_TIMEOUT_SECONDS` 总超时约束。路由首先短连接 `REACHY_CONVERSATION_RPC_URL` 调用 `conversation.say`；只有收到匹配 JSON-RPC id 的成功 result 才结束。连接失败、`not_running` 或其他 RPC error 时，才使用 Seed-TTS 2.0 合成完整 MP3，上传 daemon 并调用 `play_sound`。conversation 成功时绝不会调用 TTS。上传文件使用唯一名称，播放成功后默认延迟 300 秒删除，避免播放中删除。
+
+### curl
+
+```bash
+curl -sS http://127.0.0.1:8766/speak \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer ${SPEAK_API_TOKEN}" \
+  -d '{"text":"晚饭准备好了"}'
+```
+
+`SPEAK_API_TOKEN` 为空时允许可信内网免鉴权调用，并在进程生命周期内警告一次；非空时必须发送 Bearer token。请求体不能指定 daemon、conversation 或 TTS URL，避免形成 SSRF 入口。
+
+### Home Assistant `rest_command`
+
+将 token 放入 HA `secrets.yaml`，不要硬编码：
+
+```yaml
+# configuration.yaml
+rest_command:
+  reachy_speak:
+    url: "http://127.0.0.1:8766/speak"
+    method: POST
+    headers:
+      authorization: "Bearer {{ token }}"
+      content-type: "application/json"
+    payload: '{"text": {{ text | tojson }} }'
+
+# automation/script 调用
+# action: rest_command.reachy_speak
+# data:
+#   text: "晚饭准备好了"
+#   token: !secret reachy_speak_api_token
+```
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `SPEAK_HTTP_HOST` / `SPEAK_HTTP_PORT` | `0.0.0.0` / `8766` | HTTP 监听地址 |
+| `SPEAK_API_TOKEN` | 空 | 可选 Bearer token |
+| `SPEAK_TOTAL_TIMEOUT_SECONDS` | `45` | 排队、conversation、fallback 的请求总超时 |
+| `REACHY_CONVERSATION_RPC_URL` | `ws://192.168.31.94:7860/rpc` | conversation JSON-RPC WebSocket |
+| `REACHY_DAEMON_URL` | `http://192.168.31.94:8000` | daemon API base URL |
+| `VOLC_TTS_URL` | `wss://openspeech.bytedance.com/api/v3/tts/bidirection` | Seed-TTS v3 WebSocket |
+| `VOLC_TTS_RESOURCE_ID` | `seed-tts-2.0` | TTS resource id |
+| `VOLC_TTS_VOICE` | `zh_female_vv_uranus_bigtts` | HA 集成中 `seed-tts-2.0` 的默认中文音色，可通过环境变量覆盖；显式设为空时仅 fallback 明确报错，不阻断启动 |
+| `VOLC_TTS_TIMEOUT_SECONDS` | `30` | TTS 整体超时 |
+| `VOLC_TTS_MAX_AUDIO_BYTES` | `16777216` | 单次合成音频硬上限 |
+| `DAEMON_SOUND_TIMEOUT_SECONDS` | `10` | daemon upload、play、delete 各自的请求超时 |
+| `DAEMON_SOUND_CLEANUP_DELAY_SECONDS` | `300` | 上传音频延迟清理秒数 |
+
+TTS 复用 STT 的 `VOLC_APP_KEY/VOLC_ACCESS_KEY`，并按现有 HA 集成使用 `X-Api-App-Key/X-Api-Access-Key` 请求头；仓库不保存 secret。当前开发环境无法连接 `192.168.31.94` 实机，本功能只进行了协议解析和全 mock 网络验证；conversation handler、实际音色授权、daemon 上传/播放/延迟删除仍需在受控实机环境验证。

@@ -16,13 +16,21 @@ import struct
 import time
 import uuid
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import aiohttp
+from aiohttp import web
 from audio_gate import AudioGate, GateMode, Utterance, WakeMarker
+from reachy_speaker import (
+    ConversationSayClient,
+    DaemonSoundClient,
+    ReachySpeaker,
+    VolcengineTtsClient,
+    create_speak_app,
+)
 from wake_word import SAMPLE_RATE, WakeEvent, WakeWordDetector
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import ServerConnection, serve
@@ -87,8 +95,8 @@ class Settings:
     port: int
     path: str
     volc_url: str
-    app_key: str
-    access_key: str
+    app_key: str = field(repr=False)
+    access_key: str = field(repr=False)
     resource_id: str
     sample_rate: int
     volc_timeout_s: float
@@ -107,6 +115,18 @@ class Settings:
     hf_token: str
     reachy_daemon_url: str
     upstream_open_timeout_s: float
+    speak_http_host: str
+    speak_http_port: int
+    speak_api_token: str = field(repr=False)
+    reachy_conversation_rpc_url: str
+    volc_tts_url: str
+    volc_tts_resource_id: str
+    volc_tts_voice: str
+    volc_tts_timeout_s: float
+    speak_total_timeout_s: float
+    volc_tts_max_audio_bytes: int
+    daemon_sound_timeout_s: float
+    daemon_sound_cleanup_delay_s: float
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -188,6 +208,28 @@ class Settings:
             hf_token=os.getenv("HF_TOKEN", "").strip(),
             reachy_daemon_url=os.getenv("REACHY_DAEMON_URL", "http://192.168.31.94:8000").rstrip("/"),
             upstream_open_timeout_s=number("UPSTREAM_OPEN_TIMEOUT_SECONDS", "20", minimum=0.1),
+            speak_http_host=os.getenv("SPEAK_HTTP_HOST", "0.0.0.0"),
+            speak_http_port=integer("SPEAK_HTTP_PORT", "8766", minimum=1, maximum=65535),
+            speak_api_token=os.getenv("SPEAK_API_TOKEN", ""),
+            reachy_conversation_rpc_url=os.getenv(
+                "REACHY_CONVERSATION_RPC_URL", "ws://192.168.31.94:7860/rpc"
+            ).strip(),
+            volc_tts_url=os.getenv(
+                "VOLC_TTS_URL", "wss://openspeech.bytedance.com/api/v3/tts/bidirection"
+            ).strip(),
+            volc_tts_resource_id=os.getenv("VOLC_TTS_RESOURCE_ID", "seed-tts-2.0").strip(),
+            volc_tts_voice=os.getenv("VOLC_TTS_VOICE", "zh_female_vv_uranus_bigtts").strip(),
+            volc_tts_timeout_s=number("VOLC_TTS_TIMEOUT_SECONDS", "30", minimum=0.1),
+            speak_total_timeout_s=number("SPEAK_TOTAL_TIMEOUT_SECONDS", "45", minimum=0.1),
+            volc_tts_max_audio_bytes=integer(
+                "VOLC_TTS_MAX_AUDIO_BYTES", str(16 * 1024 * 1024), minimum=1
+            ),
+            daemon_sound_timeout_s=number(
+                "DAEMON_SOUND_TIMEOUT_SECONDS", "10", minimum=0.1
+            ),
+            daemon_sound_cleanup_delay_s=number(
+                "DAEMON_SOUND_CLEANUP_DELAY_SECONDS", "300", minimum=0.0
+            ),
         )
 
 
@@ -1151,6 +1193,62 @@ async def websocket_handler(websocket: ServerConnection, settings: Settings) -> 
         LOG.info("Reachy disconnected: %s", peer)
 
 
+async def run_servers(settings: Settings, stop: asyncio.Event) -> None:
+    """Run STT WebSocket and active-speech HTTP listeners with shared clients."""
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=None)
+    async with aiohttp.ClientSession(timeout=timeout) as http:
+        conversation = ConversationSayClient(
+            http, settings.reachy_conversation_rpc_url,
+            timeout_s=min(5.0, settings.speak_total_timeout_s),
+        )
+        tts = VolcengineTtsClient(
+            http,
+            url=settings.volc_tts_url,
+            app_id=settings.app_key,
+            access_key=settings.access_key,
+            resource_id=settings.volc_tts_resource_id,
+            voice=settings.volc_tts_voice,
+            timeout_s=settings.volc_tts_timeout_s,
+            max_audio_bytes=settings.volc_tts_max_audio_bytes,
+        )
+        daemon = DaemonSoundClient(
+            http,
+            settings.reachy_daemon_url,
+            cleanup_delay_s=settings.daemon_sound_cleanup_delay_s,
+            timeout_s=settings.daemon_sound_timeout_s,
+        )
+        speaker = ReachySpeaker(conversation, tts, daemon)
+        app = create_speak_app(
+            speaker,
+            token=settings.speak_api_token,
+            total_timeout_s=settings.speak_total_timeout_s,
+        )
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, settings.speak_http_host, settings.speak_http_port)
+        try:
+            await site.start()
+            LOG.info(
+                "Active speech HTTP listening on http://%s:%d",
+                settings.speak_http_host,
+                settings.speak_http_port,
+            )
+            async with serve(
+                lambda ws: websocket_handler(ws, settings),
+                settings.host,
+                settings.port,
+                max_size=4 * 1024 * 1024,
+                ping_interval=20,
+                ping_timeout=20,
+            ):
+                await stop.wait()
+        finally:
+            # Stop accepting HTTP work before cancelling delayed cleanup tasks
+            # and closing the shared ClientSession.
+            await runner.cleanup()
+            await speaker.close()
+
+
 async def async_main() -> None:
     settings = Settings.from_environment()
     stop = asyncio.Event()
@@ -1167,15 +1265,7 @@ async def async_main() -> None:
         settings.volc_url,
         settings.resource_id,
     )
-    async with serve(
-        lambda ws: websocket_handler(ws, settings),
-        settings.host,
-        settings.port,
-        max_size=4 * 1024 * 1024,
-        ping_interval=20,
-        ping_timeout=20,
-    ):
-        await stop.wait()
+    await run_servers(settings, stop)
 
 
 def main() -> None:
