@@ -96,7 +96,7 @@ Reachy 社区唤醒模型来自 `andyjmorgan/reachy-wake-word`，采用 **CC BY-
 - `POST /speak`：JSON 为 `{"text":"要播报的文本","open_gate":true,"allow_tts_fallback":true}`；文本 trim 后不能为空，UTF-8 编码不超过 4000 字节。两个 option 都必须是 JSON boolean：`open_gate` 默认 `false`，`allow_tts_fallback` 默认 `true`；字符串 `"true"/"false"` 会返回 400。
 - 成功返回包含 `ok`、实际 `route`、`fallback_allowed`、`gate_requested/gate_opened/gate_reason` 和 `request_id`。`open_gate=true` 只在播报完整成功后生效：enforce 且恰有一个 live Reachy 连接时，为下一句回复开启现有 30 秒 speaker 窗口；0 个、多连接或 off/shadow 只返回对应 reason，不使成功播报失败。
 - `allow_tts_fallback=false` 时只调用 `conversation.say`；若 conversation 不可用则返回 502、`reason=fallback_disabled`，不会调用 Volc TTS/daemon，也不会开 gate。
-- 输入错误返回 400；鉴权失败返回 401；conversation 与 TTS/daemon 两条路径均失败或播报阶段总超时返回 502。播报成功后的 gate opening 超时/异常仍返回 200，避免 HA 重试造成重复播报。
+- 输入错误返回 400；conversation 与 TTS/daemon 两条路径均失败或播报阶段总超时返回 502。播报成功后的 gate opening 超时/异常仍返回 200，避免 HA 重试造成重复播报。
 
 请求由进程内 `asyncio.Lock` 串行，且受 `SPEAK_TOTAL_TIMEOUT_SECONDS` 总超时约束。路由首先短连接 `REACHY_CONVERSATION_RPC_URL` 调用 `conversation.say`；只有收到匹配 JSON-RPC id 的成功 result 才结束。连接失败、`not_running` 或其他 RPC error 时，才使用 Seed-TTS 2.0 合成完整 MP3，上传 daemon 并调用 `play_sound`。conversation 成功时绝不会调用 TTS。上传文件使用唯一名称，播放成功后默认延迟 300 秒删除，避免播放中删除。
 
@@ -105,15 +105,14 @@ Reachy 社区唤醒模型来自 `andyjmorgan/reachy-wake-word`，采用 **CC BY-
 ```bash
 curl -sS http://127.0.0.1:8766/speak \
   -H 'Content-Type: application/json' \
-  -H "Authorization: Bearer ${SPEAK_API_TOKEN}" \
   -d '{"text":"晚饭准备好了","open_gate":true,"allow_tts_fallback":true}'
 ```
 
-`SPEAK_API_TOKEN` 为空时允许可信内网免鉴权调用，并在进程生命周期内警告一次；非空时必须发送 Bearer token。请求体不能指定 daemon、conversation 或 TTS URL，避免形成 SSRF 入口。
+`/health` 与 `/speak` 均供可信内网直接访问。请求体不能指定 daemon、conversation 或 TTS URL，避免形成 SSRF 入口。
 
 ### Home Assistant `rest_command`
 
-将 token 放入 HA `secrets.yaml`，不要硬编码：
+Home Assistant 可直接调用可信内网中的 adapter：
 
 ```yaml
 # configuration.yaml
@@ -122,7 +121,6 @@ rest_command:
     url: "http://127.0.0.1:8766/speak"
     method: POST
     headers:
-      authorization: "Bearer {{ token }}"
       content-type: "application/json"
     payload: '{"text": {{ text | tojson }}, "open_gate": {{ open_gate | default(false) | tojson }}, "allow_tts_fallback": {{ allow_tts_fallback | default(true) | tojson }} }'
 
@@ -132,7 +130,6 @@ rest_command:
 #   text: "晚饭准备好了"
 #   open_gate: true
 #   allow_tts_fallback: true
-#   token: !secret reachy_speak_api_token
 ```
 
 ### 环境变量
@@ -140,7 +137,6 @@ rest_command:
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `SPEAK_HTTP_HOST` / `SPEAK_HTTP_PORT` | `0.0.0.0` / `8766` | HTTP 监听地址 |
-| `SPEAK_API_TOKEN` | 空 | 可选 Bearer token |
 | `SPEAK_TOTAL_TIMEOUT_SECONDS` | `45` | 排队、conversation、fallback 的请求总超时 |
 | `REACHY_CONVERSATION_RPC_URL` | `ws://192.168.31.94:7860/rpc` | conversation JSON-RPC WebSocket |
 | `REACHY_DAEMON_URL` | `http://192.168.31.94:8000` | daemon API base URL |
@@ -148,8 +144,101 @@ rest_command:
 | `VOLC_TTS_RESOURCE_ID` | `seed-tts-2.0` | TTS resource id |
 | `VOLC_TTS_VOICE` | `zh_female_vv_uranus_bigtts` | HA 集成中 `seed-tts-2.0` 的默认中文音色，可通过环境变量覆盖；显式设为空时仅 fallback 明确报错，不阻断启动 |
 | `VOLC_TTS_TIMEOUT_SECONDS` | `30` | TTS 整体超时 |
-| `VOLC_TTS_MAX_AUDIO_BYTES` | `16777216` | 单次合成音频硬上限 |
+| `VOLC_TTS_MAX_AUDIO_BYTES` | `16777216` | 单次合成音频硬上限；超过上限或空结果不会缓存 |
+| `VOLC_TTS_CACHE_ENTRIES` | `100` | fallback 完整音频的进程内 LRU 条目上限；`0` 禁用。缓存键包含 resource、voice、音频参数和文本，命中后仍会上传并播放 |
 | `DAEMON_SOUND_TIMEOUT_SECONDS` | `10` | daemon upload、play、delete 各自的请求超时 |
 | `DAEMON_SOUND_CLEANUP_DELAY_SECONDS` | `300` | 上传音频延迟清理秒数 |
 
 TTS 复用 STT 的 `VOLC_APP_KEY/VOLC_ACCESS_KEY`，并按现有 HA 集成使用 `X-Api-App-Key/X-Api-Access-Key` 请求头；仓库不保存 secret。当前开发环境无法连接 `192.168.31.94` 实机，本功能只进行了协议解析和全 mock 网络验证；conversation handler、实际音色授权、daemon 上传/播放/延迟删除仍需在受控实机环境验证。
+
+
+## Reachy Mini 原生 systemd 部署（Debian aarch64）
+
+此方案直接使用 Reachy Mini 上的 Python 3.12（`/venvs/mini_daemon/bin/python`）创建应用独立 venv，**不使用 Docker**。应用安装到 `/opt/volc-stt-adapter`，秘密配置保存在 `/etc/volc-stt-adapter/adapter.env`；STT 只监听 `127.0.0.1:8765`，`/speak` 监听 `0.0.0.0:8766` 供 LAN 调用。
+
+### 安装
+
+在仓库根目录执行：
+
+```bash
+sudo ./scripts/install-systemd.sh
+sudoedit /etc/volc-stt-adapter/adapter.env
+# 至少填写 VOLC_APP_KEY、VOLC_ACCESS_KEY。
+sudo systemctl start volc-stt-adapter.service
+```
+
+安装器幂等同步明确列出的程序、requirements 和模型，不删除现场 `.venv`。它会执行 `daemon-reload` 和 `enable`，但默认不启动，避免示例凭据为空时反复失败；只有显式执行 `sudo ./scripts/install-systemd.sh --start` 才会立即 restart/start。已有 `adapter.env` 不会被覆盖。
+
+systemd unit 通过 `EnvironmentFile=/etc/volc-stt-adapter/adapter.env` 注入配置；程序本身不会自动查找这个系统级文件。若需要在 shell 中手工运行，必须先显式导出其中的变量：
+
+```bash
+set -a
+source /etc/volc-stt-adapter/adapter.env
+set +a
+/opt/volc-stt-adapter/.venv/bin/python /opt/volc-stt-adapter/volc_stt_adapter.py
+```
+
+### 将 Conversation 上游切到 localhost adapter
+
+创建或更新 daemon drop-in：
+
+```bash
+sudo install -d -m 0755 /etc/systemd/system/reachy-mini-daemon.service.d
+sudoedit /etc/systemd/system/reachy-mini-daemon.service.d/stt-adapter.conf
+```
+
+内容如下：
+
+```ini
+[Service]
+Environment="HF_REALTIME_CONNECTION_MODE=local"
+Environment="HF_REALTIME_WS_URL=ws://127.0.0.1:8765/v1/realtime"
+```
+
+应用 drop-in（先启动 adapter，再重启 daemon）：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl start volc-stt-adapter.service
+sudo systemctl restart reachy-mini-daemon.service
+```
+
+adapter 自身通过 `ws://127.0.0.1:7860/rpc` 调用 conversation，并通过 `http://127.0.0.1:8000` 调用 daemon。unit 仅使用 `NoNewPrivileges` 和 `PrivateTmp` 做基础加固，不启用会阻断 localhost、外部火山/HF 服务或 `/opt/volc-stt-adapter/models` 的网络/文件系统 sandbox。
+
+### 验证与日志
+
+```bash
+systemctl is-enabled volc-stt-adapter.service
+systemctl status volc-stt-adapter.service reachy-mini-daemon.service
+journalctl -u volc-stt-adapter.service -n 100 --no-pager
+curl -fsS http://127.0.0.1:8766/health
+ss -lnt | grep -E '127\.0\.0\.1:8765|0\.0\.0\.0:8766'
+curl -sS http://127.0.0.1:8766/speak \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"systemd 部署验证","allow_tts_fallback":true}'
+```
+
+预期 STT 不对 LAN 暴露，而 `/speak` 可从可信 LAN 通过 `http://<reachy-mini-ip>:8766/speak` 访问。防火墙如已启用，只需为可信网段放行 TCP 8766，不要放行 8765。
+
+### Home Assistant `/speak` URL 迁移
+
+如果 Home Assistant 不在 Reachy Mini 本机，把 `rest_command` URL 从旧 adapter/Docker 地址迁移为：
+
+```yaml
+url: "http://<reachy-mini-ip>:8766/speak"
+```
+
+`/health` 与 `/speak` 均无需 Authorization，仅应暴露给可信内网。若 Home Assistant 与服务确实同机，才使用 `http://127.0.0.1:8766/speak`。
+
+### 回滚
+
+先让 daemon 恢复内置 Hugging Face 上游，再停用 adapter：
+
+```bash
+sudo rm -f /etc/systemd/system/reachy-mini-daemon.service.d/stt-adapter.conf
+sudo systemctl daemon-reload
+sudo systemctl restart reachy-mini-daemon.service
+sudo systemctl disable --now volc-stt-adapter.service
+```
+
+上述操作保留 `/etc/volc-stt-adapter/adapter.env`、`/opt/volc-stt-adapter` 和独立 `.venv`，便于再次启用。确认无需保留后再人工删除；回滚不需要 Docker，也不应修改 Reachy daemon 的 Python venv。

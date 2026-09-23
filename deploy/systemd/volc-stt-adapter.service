@@ -1,0 +1,27 @@
+[Unit]
+Description=Reachy Mini Volcengine STT Adapter
+After=network-online.target reachy-mini-daemon.service
+Wants=network-online.target reachy-mini-daemon.service
+
+[Service]
+Type=simple
+User=pollen
+Group=pollen
+WorkingDirectory=/opt/volc-stt-adapter
+EnvironmentFile=/etc/volc-stt-adapter/adapter.env
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=NUMEXPR_NUM_THREADS=1
+ExecStart=/opt/volc-stt-adapter/.venv/bin/python /opt/volc-stt-adapter/volc_stt_adapter.py
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=20s
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=volc-stt-adapter
+
+[Install]
+WantedBy=multi-user.target
