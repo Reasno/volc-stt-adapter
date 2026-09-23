@@ -7,9 +7,14 @@ services:
     env_file:
       - .env
     environment:
-      # Prefix-only wake words (comma-separated). Edit here, then
-      # `docker compose up -d` to apply -- no image rebuild needed.
-      - VOLC_GATE_PREFIX_WORDS=语音,微信,一起,云溪,微启,允许,机器,运气
+      - KWS_MODE=${KWS_MODE:-shadow}
+      - KWS_MODEL_PATH=${KWS_MODEL_PATH:-/app/models/reechy-spk150-steps100k-acc98.15-rec97.50.onnx}
+      - KWS_THRESHOLD=${KWS_THRESHOLD:-0.5}
+      - KWS_PREROLL_SECONDS=${KWS_PREROLL_SECONDS:-1.5}
+      - KWS_TRIGGER_TIMEOUT_SECONDS=${KWS_TRIGGER_TIMEOUT_SECONDS:-3}
+      - KWS_SPEAKER_WINDOW_SECONDS=${KWS_SPEAKER_WINDOW_SECONDS:-30}
+      - KWS_MATCH_TOLERANCE_MS=${KWS_MATCH_TOLERANCE_MS:-400}
+      - KWS_QUEUE_FRAMES=${KWS_QUEUE_FRAMES:-32}
     volumes:
       - /var/lib/homeassistant/homeassistant/.storage:/var/lib/homeassistant/homeassistant/.storage:ro
     network_mode: host

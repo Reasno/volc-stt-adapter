@@ -9,6 +9,7 @@ import contextlib
 import gzip
 import json
 import logging
+import math
 import os
 import signal
 import struct
@@ -18,9 +19,11 @@ import wave
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import aiohttp
+from audio_gate import AudioGate, GateMode, Utterance, WakeMarker
+from wake_word import SAMPLE_RATE, WakeEvent, WakeWordDetector
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
@@ -36,14 +39,6 @@ POS_SEQUENCE = 0x1
 NEG_WITH_SEQUENCE = 0x3
 SERIALIZATION_JSON = 0x1
 COMPRESSION_GZIP = 0x1
-
-KEYWORD_GATE_WORDS = ("reachy", "瑞奇", "瑞琪", "瑞吉", "richie", "ricky", "richey", "riche", "reach")
-# Prefix-only wake words: open the gate only when the utterance *starts* with
-# one of these (common ASR mishearings of the wake phrase); a mid-sentence
-# occurrence must not count. Override with VOLC_GATE_PREFIX_WORDS (comma-separated).
-DEFAULT_KEYWORD_GATE_PREFIX_WORDS = ("语音", "微信", "一起", "云溪", "微启", "允许", "机器", "运气")
-KEYWORD_GATE_WINDOW_S = 30.0
-
 
 def load_dotenv(path: str | None) -> None:
     """Load a small KEY=VALUE file without adding python-dotenv as a dependency."""
@@ -98,8 +93,14 @@ class Settings:
     sample_rate: int
     volc_timeout_s: float
     boosting_table_id: str
-    keyword_gate_enabled: bool
-    keyword_gate_prefix_words: tuple[str, ...]
+    kws_mode: GateMode
+    kws_model_path: str
+    kws_threshold: float
+    kws_preroll_seconds: float
+    kws_trigger_timeout_seconds: float
+    kws_speaker_window_seconds: float
+    kws_match_tolerance_ms: float
+    kws_queue_frames: int
     upstream_mode: str
     upstream_url: str
     upstream_session_url: str
@@ -131,25 +132,53 @@ class Settings:
         if missing:
             raise RuntimeError(f"Missing required credentials: {', '.join(missing)}")
 
-        prefix_words_raw = os.getenv("VOLC_GATE_PREFIX_WORDS", "").replace("，", ",")
-        keyword_gate_prefix_words = tuple(
-            word.strip() for word in prefix_words_raw.split(",") if word.strip()
-        ) or DEFAULT_KEYWORD_GATE_PREFIX_WORDS
+        def number(name: str, default: str, *, minimum: float, maximum: float | None = None) -> float:
+            try:
+                value = float(os.getenv(name, default))
+            except ValueError as exc:
+                raise RuntimeError(f"{name} must be a number") from exc
+            if not math.isfinite(value) or value < minimum or (maximum is not None and value > maximum):
+                limit = f"[{minimum}, {maximum}]" if maximum is not None else f">= {minimum}"
+                raise RuntimeError(f"{name} must be a finite number in {limit}")
+            return value
+
+        def integer(name: str, default: str, *, minimum: int, maximum: int | None = None) -> int:
+            value = number(name, default, minimum=minimum, maximum=maximum)
+            if not value.is_integer():
+                raise RuntimeError(f"{name} must be an integer")
+            return int(value)
+
+        try:
+            kws_mode = GateMode(os.getenv("KWS_MODE", "shadow").strip().lower())
+        except ValueError as exc:
+            raise RuntimeError("KWS_MODE must be one of: off, shadow, enforce") from exc
+        sample_rate = integer("AUDIO_SAMPLE_RATE", "16000", minimum=1)
+        if sample_rate != SAMPLE_RATE:
+            raise RuntimeError("AUDIO_SAMPLE_RATE must be 16000 when using this adapter")
+        queue_frames = integer("KWS_QUEUE_FRAMES", "32", minimum=1)
 
         return cls(
             host=os.getenv("ADAPTER_HOST", "0.0.0.0"),
-            port=int(os.getenv("ADAPTER_PORT", "8765")),
+            port=integer("ADAPTER_PORT", "8765", minimum=1, maximum=65535),
             path=os.getenv("ADAPTER_PATH", "/v1/realtime"),
             volc_url=volc_url or "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async",
             app_key=app_key,
             access_key=access_key,
             resource_id=resource_id,
-            sample_rate=int(os.getenv("AUDIO_SAMPLE_RATE", "16000")),
-            volc_timeout_s=float(os.getenv("VOLC_TIMEOUT_SECONDS", "30")),
+            sample_rate=sample_rate,
+            volc_timeout_s=number("VOLC_TIMEOUT_SECONDS", "30", minimum=0.1),
             boosting_table_id=os.getenv("VOLC_BOOSTING_TABLE_ID", "").strip(),
-            keyword_gate_enabled=os.getenv("KEYWORD_GATE_ENABLED", "true").strip().lower()
-            not in {"0", "false", "no", "off"},
-            keyword_gate_prefix_words=keyword_gate_prefix_words,
+            kws_mode=kws_mode,
+            kws_model_path=os.getenv(
+                "KWS_MODEL_PATH",
+                str(Path(__file__).with_name("models") / "reechy-spk150-steps100k-acc98.15-rec97.50.onnx"),
+            ).strip(),
+            kws_threshold=number("KWS_THRESHOLD", "0.5", minimum=0.0, maximum=1.0),
+            kws_preroll_seconds=number("KWS_PREROLL_SECONDS", "1.5", minimum=0.0),
+            kws_trigger_timeout_seconds=number("KWS_TRIGGER_TIMEOUT_SECONDS", "3", minimum=0.001),
+            kws_speaker_window_seconds=number("KWS_SPEAKER_WINDOW_SECONDS", "30", minimum=0.001),
+            kws_match_tolerance_ms=number("KWS_MATCH_TOLERANCE_MS", "400", minimum=0.0),
+            kws_queue_frames=queue_frames,
             upstream_mode=os.getenv("UPSTREAM_MODE", "allocator").strip().lower(),
             upstream_url=os.getenv("UPSTREAM_REALTIME_URL", "").strip(),
             upstream_session_url=os.getenv(
@@ -158,7 +187,7 @@ class Settings:
             ).strip(),
             hf_token=os.getenv("HF_TOKEN", "").strip(),
             reachy_daemon_url=os.getenv("REACHY_DAEMON_URL", "http://192.168.31.94:8000").rstrip("/"),
-            upstream_open_timeout_s=float(os.getenv("UPSTREAM_OPEN_TIMEOUT_SECONDS", "20")),
+            upstream_open_timeout_s=number("UPSTREAM_OPEN_TIMEOUT_SECONDS", "20", minimum=0.1),
         )
 
 
@@ -242,6 +271,31 @@ def wav_chunk(pcm: bytes, sample_rate: int) -> bytes:
     return output.getvalue()
 
 
+def utterance_times_ms(utterance: dict[str, Any]) -> tuple[float | None, float | None]:
+    """Read common Volc utterance timeline fields, conservatively.
+
+    Volc responses observed in the wild use start_time/end_time, while some
+    variants nest the same names in additions. Unknown or malformed timelines
+    are returned as missing instead of guessing and potentially binding a speaker.
+    """
+    additions = utterance.get("additions")
+    sources = (utterance, additions) if isinstance(additions, dict) else (utterance,)
+    start = end = None
+    for source in sources:
+        if start is None:
+            start = source.get("start_time", source.get("start_ms"))
+        if end is None:
+            end = source.get("end_time", source.get("end_ms"))
+    try:
+        start_ms = float(start) if start is not None else None
+        end_ms = float(end) if end is not None else None
+    except (TypeError, ValueError):
+        return None, None
+    if start_ms is None or end_ms is None or start_ms < 0 or end_ms < start_ms:
+        return None, None
+    return start_ms, end_ms
+
+
 class VolcengineStream:
     # Max transient reconnect attempts within RECONNECT_WINDOW_S before giving up.
     # 5xxxxxxx 错误码 = 火山服务端 5xx（例如 55000000 grpc RST_STREAM、55000031
@@ -250,11 +304,24 @@ class VolcengineStream:
     RECONNECT_WINDOW_S = 60.0
     RECONNECT_BACKOFF_S = (0.5, 1.5, 3.0)
 
-    def __init__(self, settings: Settings, language: str, stream_id: str, on_definite):
+    def __init__(
+        self,
+        settings: Settings,
+        language: str,
+        stream_id: str,
+        on_definite: Callable[[Utterance], Awaitable[None]],
+        on_generation_reset: Callable[[int, int], None],
+        *,
+        timeline_origin_sample: int,
+    ):
         self.settings = settings
         self.language = language
         self.item_id = stream_id
         self.on_definite = on_definite
+        self.on_generation_reset = on_generation_reset
+        self.generation = 0
+        self.timeline_origin_sample = timeline_origin_sample
+        self.sent_samples = 0
         self.http: aiohttp.ClientSession | None = None
         self.ws: aiohttp.ClientWebSocketResponse | None = None
         self.sequence = 1
@@ -272,7 +339,13 @@ class VolcengineStream:
         await self._connect_upstream()
         self.receiver = asyncio.create_task(self._receive_loop(), name=f"volc-recv-{self.item_id}")
         if initial_pcm:
-            await self.send_audio(wav_chunk(initial_pcm, self.settings.sample_rate))
+            sent = await self._send(
+                CLIENT_AUDIO_ONLY_REQUEST,
+                POS_SEQUENCE,
+                wav_chunk(initial_pcm, self.settings.sample_rate),
+            )
+            if sent:
+                self.sent_samples += len(initial_pcm) // 2
 
     async def _connect_upstream(self) -> None:
         """(Re)connect to Volcengine and send the initial full_request handshake.
@@ -299,6 +372,10 @@ class VolcengineStream:
         if self.http and not self.http.closed:
             with contextlib.suppress(Exception):
                 await self.http.close()
+        self.timeline_origin_sample += self.sent_samples
+        self.sent_samples = 0
+        self.generation += 1
+        self.on_generation_reset(self.generation, self.timeline_origin_sample)
         self.sequence = 1
         self.http = aiohttp.ClientSession(timeout=timeout)
         self.ws = await self.http.ws_connect(self.settings.volc_url, headers=headers, heartbeat=20)
@@ -396,7 +473,13 @@ class VolcengineStream:
         LOG.info("[%s] Upstream reconnect succeeded", self.item_id)
         return True
 
-    async def _send(self, message_type: int, flags: int, payload: bytes, serialization: int = 0) -> None:
+    async def _send(
+        self,
+        message_type: int,
+        flags: int,
+        payload: bytes,
+        serialization: int = 0,
+    ) -> bool:
         # Serialize sends against reconnect swaps of self.ws / self.sequence.
         # send_audio() 与 _reconnect() 都会持锁；接收方（_receive_loop）单独
         # 读 self.ws，不走这把锁，重连时会自然拿到新 ws。
@@ -407,15 +490,17 @@ class VolcengineStream:
             self.sequence += 1
             try:
                 await self.ws.send_bytes(frame)
+                return True
             except (ConnectionClosed, ConnectionResetError, aiohttp.ClientError) as exc:
                 # 上游 ws 已经断了，_receive_loop 会看到 CLOSED 类消息并触发重连。
                 # 这里静默丢弃当前帧，让下一帧写入新连接。上游少一小段音频比
                 # 让整个 stream 崩掉更能保住体感。
                 LOG.debug("[%s] send_bytes on closed ws (%s), dropping frame", self.item_id, exc)
+                return False
 
     async def send_audio(self, pcm: bytes) -> None:
-        if not self._closed:
-            await self._send(CLIENT_AUDIO_ONLY_REQUEST, POS_SEQUENCE, pcm)
+        if not self._closed and await self._send(CLIENT_AUDIO_ONLY_REQUEST, POS_SEQUENCE, pcm):
+            self.sent_samples += len(pcm) // 2
 
     async def finish(self) -> str:
         if self._closed:
@@ -508,13 +593,36 @@ class VolcengineStream:
                                     raw = utterance.get("speaker_id")
                                     if raw is not None:
                                         speaker_id = str(raw).strip() or None
+                                relative_start_ms, relative_end_ms = utterance_times_ms(utterance)
+                                origin_ms = self.timeline_origin_sample * 1000.0 / self.settings.sample_rate
+                                start_ms = (
+                                    origin_ms + relative_start_ms
+                                    if relative_start_ms is not None
+                                    else None
+                                )
+                                end_ms = (
+                                    origin_ms + relative_end_ms
+                                    if relative_end_ms is not None
+                                    else None
+                                )
                                 LOG.info(
-                                    "[%s] native VAD definite: speaker_id=%s text=%s",
+                                    "[%s] native VAD definite: generation=%d speaker_id=%s timeline=%s..%s text=%s",
                                     self.item_id,
+                                    self.generation,
                                     speaker_id,
+                                    start_ms,
+                                    end_ms,
                                     utterance_text,
                                 )
-                                await self.on_definite(utterance_text, speaker_id)
+                                await self.on_definite(
+                                    Utterance(
+                                        text=utterance_text,
+                                        speaker_id=speaker_id,
+                                        stream_generation=self.generation,
+                                        start_ms=start_ms,
+                                        end_ms=end_ms,
+                                    )
+                                )
                     if response["is_last"]:
                         return
             except asyncio.CancelledError:
@@ -555,12 +663,20 @@ class RealtimeAdapterConnection:
         self.stream: VolcengineStream | None = None
         self.item_id: str | None = None
         self.upstream_response_active = False
-        # Multi-speaker gate: any speaker who says a wake word gets their own
-        # 30s activation window. Multiple speakers can be active concurrently;
-        # each speaker's window is refreshed independently. Key is the
-        # speaker_id string, or "__unknown__" when the ASR did not label the
-        # utterance with a speaker.
-        self.keyword_gate_speakers: dict[str, float] = {}
+        self.kws_mode = settings.kws_mode
+        self.gate = AudioGate(
+            mode=self.kws_mode,
+            trigger_timeout_s=settings.kws_trigger_timeout_seconds,
+            speaker_window_s=settings.kws_speaker_window_seconds,
+            match_tolerance_ms=settings.kws_match_tolerance_ms,
+        )
+        self.detector: WakeWordDetector | None = None
+        self._pending_wake: WakeEvent | None = None
+        self._stream_starting = False
+        self._pending_stream_audio = bytearray()
+        self._pending_stream_audio_lock = asyncio.Lock()
+        self._stream_lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
 
     async def emit(self, event_type: str, **fields: Any) -> None:
         event = {"event_id": f"event_{uuid.uuid4().hex}", "type": event_type, **fields}
@@ -641,41 +757,61 @@ class RealtimeAdapterConnection:
                 await self.websocket.send(raw)
 
     async def run(self) -> None:
-        upstream_url = await self._resolve_upstream_url()
-        headers = {
-            "Authorization": f"Bearer {self.settings.hf_token or 'DUMMY'}",
-            "OpenAI-Beta": "realtime=v1",
-        }
-        LOG.info("Connecting to upstream Realtime service")
+        if self.kws_mode is not GateMode.OFF:
+            detector = WakeWordDetector(
+                self.settings.kws_model_path,
+                threshold=self.settings.kws_threshold,
+                preroll_seconds=self.settings.kws_preroll_seconds,
+                queue_frames=self.settings.kws_queue_frames,
+                on_wake=self._on_wake,
+            )
+            try:
+                await detector.start()
+            except Exception:
+                LOG.exception("KWS model load failed; connection explicitly downgraded to off")
+                self.kws_mode = GateMode.OFF
+                self.gate = AudioGate(mode=GateMode.OFF)
+                await detector.close()
+            else:
+                self.detector = detector
+                LOG.info("KWS detector ready: mode=%s threshold=%.3f", self.kws_mode.value, self.settings.kws_threshold)
         try:
-            async with connect(
-                upstream_url,
-                additional_headers=headers,
-                open_timeout=self.settings.upstream_open_timeout_s,
-                max_size=16 * 1024 * 1024,
-                ping_interval=20,
-                ping_timeout=20,
-            ) as upstream:
-                self.upstream = upstream
-                LOG.info("Upstream Realtime connection established")
-                downstream_task = asyncio.create_task(self._downstream_loop(), name="reachy-to-upstream")
-                upstream_task = asyncio.create_task(self._upstream_loop(), name="upstream-to-reachy")
-                done, pending = await asyncio.wait(
-                    {downstream_task, upstream_task}, return_when=asyncio.FIRST_COMPLETED
-                )
-                for task in pending:
-                    task.cancel()
-                for task in pending:
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
-                for task in done:
-                    task.result()
-        except ConnectionClosed:
-            pass
+            upstream_url = await self._resolve_upstream_url()
+            headers = {
+                "Authorization": f"Bearer {self.settings.hf_token or 'DUMMY'}",
+                "OpenAI-Beta": "realtime=v1",
+            }
+            LOG.info("Connecting to upstream Realtime service")
+            try:
+                async with connect(
+                    upstream_url,
+                    additional_headers=headers,
+                    open_timeout=self.settings.upstream_open_timeout_s,
+                    max_size=16 * 1024 * 1024,
+                    ping_interval=20,
+                    ping_timeout=20,
+                ) as upstream:
+                    self.upstream = upstream
+                    LOG.info("Upstream Realtime connection established")
+                    downstream_task = asyncio.create_task(self._downstream_loop(), name="reachy-to-upstream")
+                    upstream_task = asyncio.create_task(self._upstream_loop(), name="upstream-to-reachy")
+                    done, pending = await asyncio.wait(
+                        {downstream_task, upstream_task}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in pending:
+                        task.cancel()
+                    for task in pending:
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await task
+                    for task in done:
+                        task.result()
+            except ConnectionClosed:
+                pass
         finally:
             self.upstream = None
-            if self.stream:
-                await self.stream.close()
+            await self.clear_audio(emit_confirmation=False)
+            if self.detector:
+                await self.detector.close()
 
     async def handle(self, message: dict[str, Any]) -> None:
         event_type = message.get("type")
@@ -724,74 +860,146 @@ class RealtimeAdapterConnection:
         if not pcm:
             return
 
+        if self.kws_mode is GateMode.ENFORCE:
+            async with self._pending_stream_audio_lock:
+                stream_starting = self._stream_starting
+                if stream_starting:
+                    self._pending_stream_audio.extend(pcm)
+            if stream_starting:
+                if self.detector is not None:
+                    self.detector.append(pcm)
+                return
+        if self.kws_mode is GateMode.ENFORCE and self.stream is None:
+            # Before wake, audio is intentionally local-only. The detector's
+            # sample-indexed preroll is supplied when a wake event arrives.
+            if self.detector is not None:
+                self.detector.append(pcm)
+            return
         if self.stream is None:
+            await self._start_stream(pcm, timeline_origin_sample=0)
+        else:
+            await self.stream.send_audio(pcm)
+        if self.detector is not None:
+            self.detector.append(pcm)
+
+    async def _start_stream(self, initial_pcm: bytes, *, timeline_origin_sample: int) -> None:
+        async with self._stream_lock:
+            if self.stream is not None:
+                if initial_pcm:
+                    await self.stream.send_audio(initial_pcm)
+                return
             stream_id = f"stream_{uuid.uuid4().hex}"
             self.item_id = stream_id
-            self.stream = VolcengineStream(
+            stream = VolcengineStream(
                 self.settings,
                 self.language,
                 stream_id,
                 self._on_native_utterance,
+                self._on_stream_generation,
+                timeline_origin_sample=timeline_origin_sample,
             )
             try:
-                await self.stream.start(pcm)
+                await stream.start(initial_pcm)
+                self.stream = stream
             except Exception:
-                await self.stream.close()
+                await stream.close()
                 self.stream = None
                 self.item_id = None
+                self.gate.reset()
                 raise
-            LOG.info("[%s] continuous Volcengine stream started (native VAD)", stream_id)
-            return
-
-        await self.stream.send_audio(pcm)
-
-    async def _on_native_utterance(
-        self, transcript: str, speaker_id: str | None = None
-    ) -> None:
-        transcript = transcript.strip()
-        if not transcript:
-            return
-
-        if self.settings.keyword_gate_enabled:
-            now = time.time()
-            # Prune expired speaker windows first.
-            expired = [sid for sid, exp in self.keyword_gate_speakers.items() if exp <= now]
-            for sid in expired:
-                LOG.info("Keyword gate expired for speaker_id=%s", sid)
-                self.keyword_gate_speakers.pop(sid, None)
-
-            transcript_normalized = transcript.lower().strip()
-            transcript_head = transcript_normalized.lstrip("，。！？、,.!?~ ")
-            has_keyword = any(
-                keyword.lower().strip() in transcript_normalized
-                for keyword in KEYWORD_GATE_WORDS
-            ) or any(
-                transcript_head.startswith(prefix)
-                for prefix in self.settings.keyword_gate_prefix_words
+            LOG.info(
+                "[%s] Volcengine stream started: generation=%d origin_sample=%d mode=%s",
+                stream_id,
+                stream.generation,
+                stream.timeline_origin_sample,
+                self.kws_mode.value,
             )
 
-            speaker_key = speaker_id if speaker_id is not None else "__unknown__"
+    def _on_stream_generation(self, generation: int, timeline_origin_sample: int) -> None:
+        self.gate.reset(generation)
+        LOG.info(
+            "Volcengine generation reset: generation=%d origin_sample=%d; authorization revoked",
+            generation,
+            timeline_origin_sample,
+        )
+        # During enforce startup the wake precedes generation creation. Reapply
+        # it only to this newly created generation; reconnect has no pending wake.
+        if self._pending_wake is not None:
+            event = self._pending_wake
+            self._pending_wake = None
+            self.gate.on_wake(
+                WakeMarker(generation, event.sample_index, event.timestamp_ms)
+            )
 
-            if has_keyword:
-                new_activation = speaker_key not in self.keyword_gate_speakers
-                self.keyword_gate_speakers[speaker_key] = now + KEYWORD_GATE_WINDOW_S
-                LOG.info(
-                    "Keyword gate %s for %.0fs: speaker_id=%s active=%s",
-                    "opened" if new_activation else "refreshed",
-                    KEYWORD_GATE_WINDOW_S,
-                    speaker_id,
-                    sorted(self.keyword_gate_speakers.keys()),
+    async def _on_wake(self, event: WakeEvent) -> None:
+        if self.detector is not None and event.detector_generation != self.detector.generation:
+            LOG.debug("Ignoring stale KWS event from detector generation %d", event.detector_generation)
+            return
+        LOG.info(
+            "KWS wake: score=%.3f sample_index=%d timestamp_ms=%.1f mode=%s",
+            event.score,
+            event.sample_index,
+            event.timestamp_ms,
+            self.kws_mode.value,
+        )
+        if self.kws_mode is GateMode.ENFORCE and self.stream is None:
+            await self._start_after_wake(event)
+            return
+        generation = self.stream.generation if self.stream is not None else 0
+        self.gate.on_wake(WakeMarker(generation, event.sample_index, event.timestamp_ms))
+
+    async def _start_after_wake(self, event: WakeEvent) -> None:
+        async with self._lifecycle_lock:
+            if self.stream is not None:
+                self.gate.on_wake(
+                    WakeMarker(self.stream.generation, event.sample_index, event.timestamp_ms)
                 )
-            else:
-                if speaker_key not in self.keyword_gate_speakers:
-                    LOG.info(
-                        "Keyword gate suppressed transcript: speaker_id=%s not in active set %s",
-                        speaker_id,
-                        sorted(self.keyword_gate_speakers.keys()),
-                    )
-                    return
-                # Active speaker keeps talking — extend their own window only.
-                self.keyword_gate_speakers[speaker_key] = now + KEYWORD_GATE_WINDOW_S
+                return
+            self._pending_wake = event
+            async with self._pending_stream_audio_lock:
+                self._stream_starting = True
+            try:
+                origin = max(0, event.sample_index - len(event.preroll_pcm) // 2)
+                await self._start_stream(event.preroll_pcm, timeline_origin_sample=origin)
+                assert self.stream is not None
+                while True:
+                    async with self._pending_stream_audio_lock:
+                        if not self._pending_stream_audio:
+                            self._stream_starting = False
+                            break
+                        # Atomic swap: data appended while send_audio awaits is
+                        # written to a fresh buffer and drained next round.
+                        buffered = bytes(self._pending_stream_audio)
+                        self._pending_stream_audio = bytearray()
+                    await self.stream.send_audio(buffered)
+            finally:
+                self._pending_wake = None
+                async with self._pending_stream_audio_lock:
+                    self._stream_starting = False
+                    self._pending_stream_audio.clear()
+
+    async def _on_native_utterance(self, utterance: Utterance) -> None:
+        transcript = utterance.text.strip()
+        if not transcript:
+            return
+        decision = self.gate.decide(utterance)
+        LOG.info(
+            "KWS gate decision: mode=%s state=%s allow=%s enforce_allow=%s reason=%s generation=%d speaker_id=%s text=%s",
+            self.kws_mode.value,
+            decision.state.value,
+            decision.allow,
+            decision.enforce_allow,
+            decision.reason,
+            utterance.stream_generation,
+            utterance.speaker_id,
+            transcript,
+        )
+        if decision.reason == "trigger_utterance_missing_timeline":
+            LOG.warning(
+                "Wake-matched first definite utterance has no usable timeline; allowing once without speaker authorization"
+            )
+        if not decision.allow:
+            return
 
         item_id = f"item_{uuid.uuid4().hex}"
         if self.upstream_response_active:
@@ -800,17 +1008,16 @@ class RealtimeAdapterConnection:
             )
             self.upstream_response_active = False
 
-        # Reachy only sees speech_started after Volcengine native VAD has marked
-        # a non-empty utterance definite. Mechanical noise with no definite text
-        # therefore cannot switch the UI/state machine into a user-speech turn.
-        await self.emit("input_audio_buffer.speech_started", audio_start_ms=0, item_id=item_id)
+        start_ms = int(utterance.start_ms or 0)
+        end_ms = int(utterance.end_ms or start_ms)
+        await self.emit("input_audio_buffer.speech_started", audio_start_ms=start_ms, item_id=item_id)
         await self.emit(
             "conversation.item.input_audio_transcription.delta",
             item_id=item_id,
             content_index=0,
             delta=transcript,
         )
-        await self.emit("input_audio_buffer.speech_stopped", audio_end_ms=0, item_id=item_id)
+        await self.emit("input_audio_buffer.speech_stopped", audio_end_ms=end_ms, item_id=item_id)
         await self.emit(
             "conversation.item.input_audio_transcription.completed",
             item_id=item_id,
@@ -834,10 +1041,19 @@ class RealtimeAdapterConnection:
         LOG.info("[%s] native VAD transcript injected upstream: %s", item_id, transcript)
 
     async def clear_audio(self, *, emit_confirmation: bool = True) -> None:
-        if self.stream:
-            await self.stream.close()
-        self.stream = None
-        self.item_id = None
+        async with self._lifecycle_lock:
+            if self.stream:
+                await self.stream.close()
+            self.stream = None
+            self.item_id = None
+            self._pending_wake = None
+            async with self._pending_stream_audio_lock:
+                self._stream_starting = False
+                self._pending_stream_audio.clear()
+            self.gate.clear()
+            if self.detector:
+                await self.detector.reset()
+        LOG.info("Audio cleared; stream, detector timeline, and KWS authorization reset")
         if emit_confirmation:
             await self.emit("input_audio_buffer.cleared")
 

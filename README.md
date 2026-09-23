@@ -1,167 +1,89 @@
 # Reachy Mini 火山引擎 STT Adapter
 
-把 Reachy Mini Conversation App 使用的 OpenAI Realtime WebSocket 连接代理到原 Hugging Face Realtime 上游，同时在本地截流 16 kHz PCM 音频并交给火山引擎流式 ASR v3。火山中文转录作为用户 `input_text` 注入上游，因此保留原有大模型回复、TTS 和工具调用能力。
+该服务代理 Reachy Mini 的 OpenAI Realtime WebSocket：控制、模型回复、TTS 与工具调用继续透传到原 Hugging Face Realtime 上游；输入的 16 kHz、单声道、PCM16 little-endian 音频由本地 openWakeWord 检测，再交给火山流式 ASR v3。火山 `definite=true` 中文分句以 `input_text` 注入原上游。
 
-## 数据流
+## KWS v2 模式
 
-```text
-Reachy ──OpenAI Realtime──> Adapter ──文本/控制事件──> Hugging Face Realtime
-                                └────PCM──> 火山 ASR
-Reachy <──音频/TTS/工具事件──── Adapter <───────────────────────┘
-       <──火山中文转录事件─────┘
-```
+`KWS_MODE` 严格支持三个值，默认 `shadow`：
 
-## 协议兼容范围
+- `off`：不加载 KWS 模型，音频持续发送火山，所有 definite 分句放行。
+- `shadow`：音频仍持续发送火山，KWS 与 speaker gate 只计算并记录 `enforce_allow/reason`，实际全部放行。用于灰度观察。
+- `enforce`：唤醒前不创建火山 stream；本地命中后创建 stream，并发送按样本索引保存的 1.5 秒预滚。只有符合授权规则的 definite 分句才注入 Reachy/HF 上游。
 
-- 监听：`ws://0.0.0.0:8765/v1/realtime`
-- 除输入音频外，客户端事件原样转发给 Hugging Face Realtime
-- 上游的回复音频、文本、工具调用和生命周期事件原样返回 Reachy
-- `session.update` 中输入转录语言强制改为 `zh-CN`
-- `input_audio_buffer.append/commit/clear` 在 adapter 终止，不转发给上游
-- 火山最终中文转录以 `conversation.item.create(input_text)` 注入上游，并触发 `response.create`
-- 上游 input-audio transcription 事件被过滤，避免重复或英文转录
-- 音频：16 kHz、单声道、PCM16 little-endian、Base64
-- VAD：不再使用 adapter 本地能量阈值；连续音频交给火山 `bigmodel_async`，仅接受二遍识别返回的 `definite=true` 分句
+唤醒记录当前火山 stream `generation`、本地 sample index 和时间轴。只有时间区间（含 `KWS_MATCH_TOLERANCE_MS`）覆盖唤醒点的 definite 分句才能绑定 `speaker_id`。授权身份是 `(stream_generation, speaker_id)`；同 speaker 的合法分句将 30 秒窗口续期，其他或缺失 speaker 的后续分句被丢弃。重连、`input_audio_buffer.clear` 或 generation 变化立即撤销授权。`TRIGGERED` 默认 3 秒超时，之后经过短暂 `CLOSING` 再回到 `SLEEPING`，不会形成永久开门反馈环。
 
-## 凭据
+若唤醒后的首个 definite 分句缺少可靠时间轴，enforce 会保守地只放行该句，不创建 30 秒 speaker 授权，并输出 warning。KWS 模型加载失败会输出 ERROR，并把该连接明确降级为 `off`，不会保留半初始化 detector。
 
-程序按以下顺序读取：
+## 安装
 
-1. 同目录 `.env`（也可用 `ENV_FILE` 指定）及进程环境变量：`VOLC_APP_KEY`、`VOLC_ACCESS_KEY`、`VOLC_RESOURCE_ID`
-2. 如果凭据不完整且设置了 `HA_CONFIG_ENTRIES`，从 HA `core.config_entries` 的首个 `volcengine_voice_assistant` / `stt` subentry 读取
+### 原生 Python 3.11 / aarch64
 
-程序不会打印凭据。推荐在 HA 小主机直接设置：
-
-```dotenv
-HA_CONFIG_ENTRIES=/var/lib/homeassistant/homeassistant/.storage/core.config_entries
-```
-
-这样不需要把密钥复制到第二个文件。若选择生成 `.env`，务必执行 `chmod 600 .env`。
-
-## 安装与运行
+openWakeWord 的包元数据依赖 `tflite-runtime`，但本项目只使用 ONNX；Python 3.11/aarch64 通常没有对应 TFLite wheel，因此必须跳过其依赖并显式安装 ONNX 依赖：
 
 ```bash
-cd /var/lib/homeassistant/volc_stt_adapter
-python3 -m venv .venv
+python3.11 -m venv .venv
 .venv/bin/pip install -r requirements.txt
+.venv/bin/pip install --no-deps openwakeword==0.6.0
 cp .env.example .env
-# 编辑 .env；推荐只启用 HA_CONFIG_ENTRIES
+# 原生运行默认模型可写相对路径：./models/reechy-spk150-steps100k-acc98.15-rec97.50.onnx
 .venv/bin/python volc_stt_adapter.py
 ```
 
-### systemd
-
-将仓库中的 `volc-stt-adapter.service` 安装到 `/etc/systemd/system/` 后：
+### Docker / Compose
 
 ```bash
-systemctl daemon-reload
-systemctl enable --now volc-stt-adapter.service
-journalctl -u volc-stt-adapter.service -f
+cp .env.example .env
+# 容器内设置 KWS_MODEL_PATH=/app/models/reechy-spk150-steps100k-acc98.15-rec97.50.onnx
+# 所有 Compose KWS 项均以 ${VAR:-default} 读取，不会硬覆盖 .env。
+docker compose up -d --build
 ```
 
-## Reachy 配置
+Dockerfile 同样使用 Python 3.11、显式 `onnxruntime` 依赖和 `openwakeword==0.6.0 --no-deps`，无需 TFLite wheel。
 
-`/etc/systemd/system/reachy-mini-daemon.service.d/stt-adapter.conf`：
+## 配置
 
-```ini
-[Service]
-Environment=HF_REALTIME_CONNECTION_MODE=local
-Environment=HF_REALTIME_WS_URL=ws://192.168.31.111:8765/v1/realtime
-```
+核心参数见 [`.env.example`](.env.example)：
 
-然后执行：
+- `KWS_MODE=shadow`
+- `KWS_MODEL_PATH`：原生路径与容器路径不同，见上文。
+- `KWS_THRESHOLD=0.5`
+- `KWS_PREROLL_SECONDS=1.5`
+- `KWS_TRIGGER_TIMEOUT_SECONDS=3`
+- `KWS_SPEAKER_WINDOW_SECONDS=30`
+- `KWS_MATCH_TOLERANCE_MS=400`
+- `KWS_QUEUE_FRAMES=32`：每连接有界推理队列；满时显式丢弃新帧并记录 warning，避免无限积压。
+
+火山凭据可直接设置 `VOLC_APP_KEY/VOLC_ACCESS_KEY/VOLC_RESOURCE_ID`，也可设置 `HA_CONFIG_ENTRIES` 从 Home Assistant storage 读取。服务不会打印凭据。
+
+## 灰度与指标
+
+建议流程：
+
+1. `off` 验证现有火山 transient reconnect 与 Reachy 上游代理行为。
+2. 使用真实房间、家庭成员、设备电机噪声录制正负样本，通过 `scripts/kws_eval.py` 调阈值。
+3. `shadow` 观察至少一个完整业务周期，比较 gate decision 与实际注入文本。
+4. 满足指标后切换 `enforce`；保留快速回退 `shadow/off` 的配置能力。
+
+重点监控：KWS score/触发数、正样本 recall、负样本 FPR、推理队列丢帧、trigger timeout、缺失 timeline/speaker、speaker 拒绝数、generation reset、模型加载失败降级次数。
+
+离线评测会对尾帧补零，并输出每条峰值及 TP/FN/FP/TN、recall、FPR：
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl restart reachy-mini-daemon
+.venv/bin/python scripts/kws_eval.py \
+  --positive samples/reachy-1.wav --positive samples/reachy-2.wav \
+  --negative samples/noise-1.wav --negative samples/conversation-1.wav \
+  --threshold 0.5
 ```
 
-## 调试
+## 模型许可
 
-- 查看火山原生 VAD 确认的分句：`journalctl -u volc-stt-adapter.service -f | grep "native VAD definite"`
-- 查看详细火山结果：临时设置 `LOG_LEVEL=DEBUG`
-- 正常底噪、舵机和电机振动不应产生 `speech_started`；只有 `definite=true` 且文本非空时才发送该事件
+Reachy 社区唤醒模型来自 `andyjmorgan/reachy-wake-word`，采用 **CC BY-NC-SA 4.0**，包含**非商业（NonCommercial）约束**；衍生与共享还须遵守署名及相同方式共享。openWakeWord 特征模型与来源说明见 [`models/README.md`](models/README.md)。在任何商业场景启用前必须完成许可评估或替换模型。
 
-## 安全说明
+## 协议与运维
 
-服务默认监听整个局域网且没有客户端认证。只建议在可信 LAN 使用；如需跨网络暴露，应增加反向代理 TLS 和鉴权。
-
-## 实施与验证报告（2026-09-21）
-
-### 1. 源码与协议确认
-
-- 使用密码 SSH 读取 Reachy 实机 snapshot：`ddc309630448a664b0283812ff80048c36966c35`。
-- 实机 `huggingface_realtime.py` SHA-256 为 `d033d17d301f83fe89364f05432ab08136c351ae87d3d0d9dbc970273d5f43cd`，与本地上游仓库 commit `f58523b` 完全一致。
-- Reachy 发送 `session.update` 和连续 `input_audio_buffer.append`；音频是 16 kHz / mono / PCM16。
-- Hugging Face 会话分配器允许匿名硬件会话分配，返回一次性 `connect_url`；adapter 不需要复制 Reachy 的 HF token。
-- HA 火山组件使用自定义二进制 v3 协议；鉴权为 `X-Api-App-Key`、`X-Api-Access-Key`、`X-Api-Resource-Id` 和随机 `X-Api-Connect-Id`。
-- HA STT subentry 字段确认：`access_key`、`app_key`、`name`、`resource_id`、`url`；未输出字段值。
-
-### 2. 实现
-
-完整实现见 [`volc_stt_adapter.py`](volc_stt_adapter.py)。它包含：
-
-- 上游 Hugging Face Realtime 会话自动分配和全双工代理；
-- 除输入音频外的 OpenAI Realtime 控制、回复音频、工具调用事件双向透传；
-- 输入 PCM 在 adapter 终止，避免上游英文 STT/VAD 与火山结果竞争；
-- 火山最终转录注入为上游 `input_text`，自动触发 `response.create`；
-- 输入转录语言强制为 `zh-CN`，并过滤上游 transcription 事件；
-- 使用火山 `bigmodel_async` 二遍识别和原生 VAD 分句，不再保留本地 RMS 阈值、前置缓冲或强制 finalize；
-- 只有火山返回非空且 `definite=true` 的分句，才向 Reachy 发送 `speech_started`、transcription 和 completed 事件；
-- `.env` 与 HA config entries 两种无硬编码凭据读取方式；
-- 连接清理、超时、错误事件和结构化日志。
-
-### 3. HA 小主机部署
-
-- 目录：`/var/lib/homeassistant/volc_stt_adapter`
-- Python：3.11 venv；因主机原先缺少 `ensurepip`，安装了 Debian `python3-venv`。
-- 依赖：`websockets 15.0.1`、`aiohttp 3.14.3`
-- 服务：`volc-stt-adapter.service`，已 enable 且 active
-- 监听：`0.0.0.0:8765`
-- 凭据：`.env` 只配置 `HA_CONFIG_ENTRIES` 路径，运行时读取 HA storage；没有复制或写死实际密钥。
-- 上游：`UPSTREAM_MODE=allocator`，每个 Reachy 连接自动获得独立 Hugging Face Realtime 会话。
-
-### 4. Reachy 配置
-
-- `/etc/systemd/system/reachy-mini-daemon.service.d/stt-adapter.conf` 已安装。
-- 原有 `transcription-language.conf` 已统一更新为 `zh-CN`，避免 drop-in 文件排序覆盖。
-- systemd 生效环境：
-
-```text
-HF_REALTIME_CONNECTION_MODE=local
-HF_REALTIME_WS_URL=ws://192.168.31.111:8765/v1/realtime
-REALTIME_TRANSCRIPTION_LANGUAGE=zh-CN
-```
-
-- `reachy_mini_conversation_app` 当前为 `running`。
-- 实机日志确认使用 adapter URL、Realtime session 更新成功、17 个工具已注册。
-
-### 5. 已完成验证
-
-- TCP、systemd、上游会话分配和 WebSocket 连接：通过。
-- OpenAI Python SDK 2.28.0 兼容性：通过。
-- 火山鉴权、中间结果、最终结果和 VAD 事件顺序：通过。
-- 中文完整链路：输入“你好，我是瑞奇机器人，今天天气不错。”，火山 completed 文本完全一致。
-- 上游大模型回复：收到中文“收到。”。
-- 上游 TTS：收到 10 KB 以上 PCM 回复音频。
-- 工具调用透传：测试函数 `turn_on_light` 收到 `response.function_call_arguments.done`。
-- Reachy 真人语音：实机日志已记录多句中文并注入上游，包括“现在几点了？”“你看看左边。”“左边有什么？”。
-
-### 6. VAD 误触发修复（2026-09-21 02:17）
-
-根因不是 Reachy 的运动状态，而是 adapter 原先使用 RMS 能量阈值（最初 450）自行切分音频，并在 800 ms“静音”后主动结束火山请求。机械振动很容易超过能量阈值；强制结束请求又会促使 ASR 对噪声做最终解码，生成伪文本，随后 adapter 注入 `response.create`，Reachy 因此进入 talking。原 Conversation App 自身并不做这个本地能量判断，只消费上游服务端事件。
-
-修复：
-
-- 完全删除 adapter 本地 RMS VAD、阈值、静音计数、前置缓冲和强制 finalize。
-- 火山端点从 `bigmodel` 切换为双向流式优化版 `bigmodel_async`。
-- 开启 `enable_nonstream=true`，使用火山默认 800 ms 原生 VAD 分句和二遍识别。
-- 只接受 `utterances[].definite == true` 且文本非空的结果。
-- 只有收到上述 definite 分句后才向 Reachy 依次发送 `speech_started`、transcription delta、`speech_stopped` 和 completed，再将文本注入 Hugging Face 上游。
-- 按用户要求，没有增加运动状态静默窗口。
-
-验证：
-
-- 合成中文语音无手工 commit 即得到 definite 文本，完整对话回复成功。
-- 110 Hz、幅度 6000、持续 5 秒的高能机械振动模拟音频，随后 2 秒静音：`speech_started=0`、completed=0、`response.created=0`。
-- 生产服务已重启并处于 active；日志无 ERROR/Traceback。
+- 监听：`ws://0.0.0.0:8765/v1/realtime`
+- 除输入音频外，客户端事件原样转发；输入 audio append/commit/clear 在 adapter 终止。
+- 上游 input-audio transcription 事件被过滤，避免重复转录。
+- 火山继续使用 `bigmodel_async`、原生 VAD、SSD speaker 信息和既有 transient reconnect。
+- `LOG_LEVEL=DEBUG` 可查看原始火山结果；INFO 可查看 KWS 与 gate decision。
+- 服务默认无客户端认证，仅建议可信 LAN；跨网络应增加 TLS 与鉴权。
