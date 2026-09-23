@@ -56,13 +56,29 @@ class AudioGateTest(unittest.TestCase):
         self.assertFalse(self.gate.decide(utterance(speaker=None, text="未知人文本")).allow)
         self.assertTrue(self.gate.decide(utterance(text="续窗后文本")).allow)
 
-    def test_missing_timeline_passes_once_without_binding(self):
+    def test_missing_timeline_binds_speaker_when_available(self):
         self.wake()
         decision = self.gate.decide(utterance(start=None, end=None, text="无时间轴首句"))
+        self.assertTrue(decision.allow)
+        self.assertTrue(decision.authorization_created)
+        self.assertEqual(decision.identity, (1, "alice"))
+        self.assertEqual(decision.state, GateState.ACTIVE)
+        self.assertEqual(decision.reason, "trigger_utterance_missing_timeline")
+        # Follow-up same-speaker utterances should keep flowing within window.
+        follow = self.gate.decide(utterance(text="续听同一说话人"))
+        self.assertTrue(follow.allow)
+        self.assertTrue(follow.authorization_refreshed)
+        # Other speakers still blocked.
+        self.assertFalse(self.gate.decide(utterance(speaker="bob", text="别人")).allow)
+
+    def test_missing_timeline_and_speaker_still_one_shot_passthrough(self):
+        self.wake()
+        decision = self.gate.decide(utterance(start=None, end=None, speaker=None, text="无时间轴无说话人"))
         self.assertTrue(decision.allow)
         self.assertFalse(decision.authorization_created)
         self.assertIsNone(decision.identity)
         self.assertEqual(decision.state, GateState.CLOSING)
+        self.assertEqual(decision.reason, "trigger_utterance_missing_timeline_and_speaker")
         self.assertFalse(self.gate.decide(utterance(text="不得续开")).allow)
 
     def test_nonmatching_interval_does_not_bind(self):

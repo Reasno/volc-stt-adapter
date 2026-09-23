@@ -172,8 +172,28 @@ class AudioGate:
 
         if self.state is GateState.TRIGGERED and self.wake is not None:
             if utterance.start_ms is None or utterance.end_ms is None:
-                self._enter_closing()
-                return self._result(True, "trigger_utterance_missing_timeline")
+                # Timeline is unavailable, so we cannot geometrically verify
+                # that this utterance covers the wake marker.  Fall back to
+                # speaker-id binding: the first definite utterance emitted
+                # while TRIGGERED is overwhelmingly the wake utterance itself,
+                # so its speaker_id is a strong-enough signal to grant a
+                # speaker window without another wake.  This avoids the
+                # pathological "one-shot passthrough followed by immediate
+                # sleeping" case where the caller can never continue the
+                # conversation because subsequent utterances hit gate_sleeping
+                # even when spoken by the same person.
+                if not utterance.speaker_id:
+                    self._enter_closing()
+                    return self._result(
+                        True, "trigger_utterance_missing_timeline_and_speaker"
+                    )
+                self.identity = (utterance.stream_generation, utterance.speaker_id)
+                self.wake = None
+                self.state = GateState.ACTIVE
+                self._deadline = self._clock() + self.speaker_window_s
+                return self._result(
+                    True, "trigger_utterance_missing_timeline", created=True
+                )
             matched = (
                 utterance.start_ms - self.match_tolerance_ms
                 <= self.wake.timestamp_ms

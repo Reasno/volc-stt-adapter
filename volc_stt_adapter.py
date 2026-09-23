@@ -1146,7 +1146,14 @@ class RealtimeAdapterConnection:
         )
         if decision.reason == "trigger_utterance_missing_timeline":
             LOG.warning(
-                "Wake-matched first definite utterance has no usable timeline; allowing once without speaker authorization"
+                "Wake-matched first definite utterance has no usable timeline; "
+                "binding speaker %s by fallback without timeline verification",
+                utterance.speaker_id,
+            )
+        elif decision.reason == "trigger_utterance_missing_timeline_and_speaker":
+            LOG.warning(
+                "Wake-matched first definite utterance has neither timeline nor speaker; "
+                "allowing once without speaker authorization"
             )
         elif decision.reason == "trigger_utterance_missing_speaker":
             LOG.warning(
