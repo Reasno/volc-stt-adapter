@@ -835,16 +835,57 @@ class RealtimeAdapterConnection:
             await self.upstream.send(json.dumps(message, ensure_ascii=False))
 
     async def _downstream_loop(self) -> None:
+        _bad_frames_logged = 0
+        decoder = json.JSONDecoder()
         async for raw in self.websocket:
             if not isinstance(raw, str):
+                if _bad_frames_logged < 10:
+                    LOG.warning(
+                        "Downstream frame is not text (type=%s, len=%d)",
+                        type(raw).__name__,
+                        len(raw) if raw is not None else 0,
+                    )
+                    _bad_frames_logged += 1
                 await self.error("invalid_request_error", "Only JSON text frames are accepted")
                 continue
-            try:
-                message = json.loads(raw)
-            except json.JSONDecodeError:
-                await self.error("invalid_request_error", "Invalid JSON")
+            # Reachy's OpenAI-realtime SDK sometimes coalesces multiple events
+            # (e.g. conversation.item.create + response.create emitted back to
+            # back) into a single WebSocket text frame. `json.loads` would then
+            # raise `Extra data`, and if we naively bounced an "Invalid JSON"
+            # error every time, Reachy's SDK output queue backs up so badly
+            # that its mic uploader stops sending audio, killing the Volcengine
+            # stream with a 45000081 no-packet timeout. Parse iteratively.
+            idx = 0
+            frame_len = len(raw)
+            parsed_ok = True
+            while idx < frame_len:
+                # Skip any whitespace/newlines between concatenated JSON docs.
+                while idx < frame_len and raw[idx] in " \t\r\n":
+                    idx += 1
+                if idx >= frame_len:
+                    break
+                try:
+                    message, offset = decoder.raw_decode(raw, idx)
+                except json.JSONDecodeError as exc:
+                    if _bad_frames_logged < 10:
+                        preview_start = max(0, idx - 40)
+                        preview_end = min(frame_len, idx + 200)
+                        LOG.warning(
+                            "Downstream frame failed JSON parse (len=%d, "
+                            "at char %d, err=%s): %r",
+                            frame_len,
+                            idx,
+                            exc,
+                            raw[preview_start:preview_end],
+                        )
+                        _bad_frames_logged += 1
+                    await self.error("invalid_request_error", "Invalid JSON")
+                    parsed_ok = False
+                    break
+                await self.handle(message)
+                idx = offset
+            if not parsed_ok:
                 continue
-            await self.handle(message)
 
     async def _upstream_loop(self) -> None:
         async for raw in self.upstream:
