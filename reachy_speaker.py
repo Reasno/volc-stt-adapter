@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import gzip
+import hashlib
 import json
 import logging
 import struct
@@ -193,11 +194,33 @@ class VolcengineTtsClient:
         self.timeout_s = timeout_s
         self.max_audio_bytes = max_audio_bytes
 
+    def _auth_cache_identity(self) -> tuple[str, str]:
+        """Return a non-secret auth mode/fingerprint for cache partitioning."""
+        mode = "app_access_key" if self.access_key else "api_key"
+        material = f"{mode}\0{self.app_id}\0{self.access_key}".encode("utf-8")
+        return mode, hashlib.sha256(material).hexdigest()
+
+    def _build_headers(self, request_id: str) -> dict[str, str]:
+        if self.access_key:
+            return {
+                "X-Api-App-Key": self.app_id,
+                "X-Api-Access-Key": self.access_key,
+                "X-Api-Resource-Id": self.resource_id,
+                "X-Api-Request-Id": request_id,
+            }
+        return {
+            "X-Api-Key": self.app_id,
+            "X-Api-Resource-Id": self.resource_id,
+            "X-Api-Connect-Id": str(uuid.uuid4()),
+        }
+
     def cache_key(self, text: str) -> tuple[Hashable, ...]:
         """Identify every configured input that can affect synthesized bytes."""
+        auth_mode, auth_identity = self._auth_cache_identity()
         return (
             self.url,
-            self.app_id,
+            auth_mode,
+            auth_identity,
             self.resource_id,
             self.voice,
             "mp3",
@@ -210,16 +233,9 @@ class VolcengineTtsClient:
     async def synthesize(self, text: str, request_id: str) -> bytes:
         if not self.voice:
             raise TtsProtocolError("VOLC_TTS_VOICE is required for daemon TTS fallback")
-        if not self.app_id or not self.access_key:
-            raise TtsProtocolError("Volcengine TTS credentials are not configured")
-        headers = {
-            # Match the deployed HA integration: access-key mode uses App-Key,
-            # not App-Id, and identifies each synthesis with Request-Id.
-            "X-Api-App-Key": self.app_id,
-            "X-Api-Access-Key": self.access_key,
-            "X-Api-Resource-Id": self.resource_id,
-            "X-Api-Request-Id": request_id,
-        }
+        if not self.app_id:
+            raise TtsProtocolError("Volcengine TTS app key is not configured")
+        headers = self._build_headers(request_id)
         session_id = str(uuid.uuid4())
         audio_params = {
             "format": "mp3",

@@ -56,8 +56,8 @@ done
 if [[ ! -x ${VENV_DIR}/bin/python ]]; then
   "${PYTHON}" -m venv "${VENV_DIR}"
 fi
-"${VENV_DIR}/bin/python" -m pip install -r "${INSTALL_DIR}/requirements.txt"
-"${VENV_DIR}/bin/python" -m pip install --no-deps openwakeword==0.6.0
+"${VENV_DIR}/bin/python" -m pip install --timeout 120 --retries 10 -r "${INSTALL_DIR}/requirements.txt"
+"${VENV_DIR}/bin/python" -m pip install --timeout 120 --retries 10 --no-deps openwakeword==0.6.0
 chown -R pollen:pollen "${VENV_DIR}"
 
 install -d -o root -g pollen -m 0750 "${ENV_DIR}"

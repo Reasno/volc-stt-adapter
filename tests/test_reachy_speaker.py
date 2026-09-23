@@ -324,8 +324,8 @@ class AggregationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TtsTests(unittest.IsolatedAsyncioTestCase):
-    def make_client(self, ws, maximum=20):
-        return VolcengineTtsClient(FakeSession(ws=ws), url="wss://tts", app_id="app", access_key="key", resource_id="seed-tts-2.0", voice="voice", timeout_s=1, max_audio_bytes=maximum)
+    def make_client(self, ws, maximum=20, access_key="key"):
+        return VolcengineTtsClient(FakeSession(ws=ws), url="wss://tts", app_id="app", access_key=access_key, resource_id="seed-tts-2.0", voice="voice", timeout_s=1, max_audio_bytes=maximum)
 
     async def test_accumulates_audio(self):
         ws = FakeWs([
@@ -343,6 +343,9 @@ class TtsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([decode_tts_frame(frame).event for frame in ws.sent_bytes], [1, 100, 200, 102, 2])
         headers = client.session.ws_calls[0][1]["headers"]
         self.assertEqual(headers["X-Api-App-Key"], "app")
+        self.assertEqual(headers["X-Api-Access-Key"], "key")
+        self.assertEqual(headers["X-Api-Request-Id"], "request")
+        self.assertEqual(headers["X-Api-Resource-Id"], "seed-tts-2.0")
         self.assertNotIn("X-Api-App-Id", headers)
         self.assertNotIn("X-Api-Connect-Id", headers)
         start_payload = json.loads(decode_tts_frame(ws.sent_bytes[1]).payload)
@@ -353,6 +356,41 @@ class TtsTests(unittest.IsolatedAsyncioTestCase):
             {"disable_markdown_filter": False},
         )
         self.assertEqual(task_payload["req_params"]["text"], "hello")
+
+    async def test_empty_access_key_uses_api_key_headers_and_synthesizes(self):
+        ws = FakeWs([
+            server_event(CONNECTION_STARTED),
+            server_event(SESSION_STARTED),
+            audio_frame(b"audio"),
+            server_event(SESSION_FINISHED),
+            server_event(CONNECTION_FINISHED),
+        ])
+        client = self.make_client(ws, access_key="")
+        first_headers = client._build_headers("ignored-request-id")
+        second_headers = client._build_headers("ignored-request-id")
+        self.assertEqual(first_headers["X-Api-Key"], "app")
+        self.assertEqual(first_headers["X-Api-Resource-Id"], "seed-tts-2.0")
+        self.assertNotIn("X-Api-App-Key", first_headers)
+        self.assertNotIn("X-Api-Access-Key", first_headers)
+        self.assertNotIn("X-Api-Request-Id", first_headers)
+        self.assertNotEqual(
+            first_headers["X-Api-Connect-Id"],
+            second_headers["X-Api-Connect-Id"],
+        )
+        self.assertEqual(await client.synthesize("hello", "request"), b"audio")
+        actual_headers = client.session.ws_calls[0][1]["headers"]
+        self.assertIn("X-Api-Connect-Id", actual_headers)
+
+    def test_cache_key_partitions_auth_modes_without_raw_credentials(self):
+        access_client = self.make_client(FakeWs([]), access_key="secret-access")
+        api_key_client = self.make_client(FakeWs([]), access_key="")
+        access_cache_key = access_client.cache_key("hello")
+        api_cache_key = api_key_client.cache_key("hello")
+        self.assertNotEqual(access_cache_key, api_cache_key)
+        self.assertIn("app_access_key", access_cache_key)
+        self.assertIn("api_key", api_cache_key)
+        self.assertNotIn("app", access_cache_key)
+        self.assertNotIn("secret-access", access_cache_key)
 
     async def test_audio_limit(self):
         ws = FakeWs([server_event(CONNECTION_STARTED), server_event(SESSION_STARTED), audio_frame(b"123456")])
