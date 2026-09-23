@@ -22,6 +22,7 @@ from reachy_speaker import (
     ConversationError,
     ConversationSayClient,
     DaemonSoundClient,
+    FallbackDisabledError,
     ReachySpeaker,
     SpeakerError,
     TtsProtocolError,
@@ -168,6 +169,27 @@ class AggregationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(route, "daemon_tts")
         daemon.upload_and_play.assert_awaited_once_with(b"mp3", "r1")
 
+    async def test_fallback_disabled_never_calls_tts_or_daemon(self):
+        conversation = SimpleNamespace(say=AsyncMock(side_effect=ConversationError("not_running")))
+        tts = SimpleNamespace(synthesize=AsyncMock())
+        daemon = SimpleNamespace(upload_and_play=AsyncMock(), close=AsyncMock())
+        with self.assertRaises(FallbackDisabledError):
+            await ReachySpeaker(conversation, tts, daemon).speak(
+                "hi", "r1", allow_tts_fallback=False
+            )
+        tts.synthesize.assert_not_awaited()
+        daemon.upload_and_play.assert_not_awaited()
+
+    async def test_fallback_disabled_conversation_success(self):
+        conversation = SimpleNamespace(say=AsyncMock())
+        tts = SimpleNamespace(synthesize=AsyncMock())
+        daemon = SimpleNamespace(upload_and_play=AsyncMock(), close=AsyncMock())
+        route = await ReachySpeaker(conversation, tts, daemon).speak(
+            "hi", "r1", allow_tts_fallback=False
+        )
+        self.assertEqual(route, "conversation")
+        tts.synthesize.assert_not_awaited()
+
     async def test_rpc_and_fallback_failure(self):
         conversation = SimpleNamespace(say=AsyncMock(side_effect=ConversationError("rpc")))
         tts = SimpleNamespace(synthesize=AsyncMock(side_effect=TtsProtocolError("tts")))
@@ -251,7 +273,14 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
 class HttpTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.speaker = SimpleNamespace(speak=AsyncMock(return_value="conversation"))
-        self.server = TestServer(create_speak_app(self.speaker, token="secret", total_timeout_s=1, max_text_bytes=10))
+        self.gate_opener = AsyncMock(return_value=(True, "proactive_reply_armed"))
+        self.server = TestServer(create_speak_app(
+            self.speaker,
+            token="secret",
+            total_timeout_s=1,
+            max_text_bytes=10,
+            gate_opener=self.gate_opener,
+        ))
         self.client = TestClient(self.server)
         await self.client.start_server()
 
@@ -270,6 +299,107 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         headers = {"Authorization": "Bearer secret"}
         self.assertEqual((await self.client.post("/speak", json={"text": "  "}, headers=headers)).status, 400)
         self.assertEqual((await self.client.post("/speak", json={"text": "中文中文"}, headers=headers)).status, 400)
+
+    async def test_open_gate_default_false_and_true(self):
+        headers = {"Authorization": "Bearer secret"}
+        response = await self.client.post("/speak", json={"text": "hi"}, headers=headers)
+        payload = await response.json()
+        self.assertFalse(payload["gate_requested"])
+        self.assertFalse(payload["gate_opened"])
+        self.assertEqual(payload["fallback_allowed"], True)
+        self.gate_opener.assert_not_awaited()
+
+        response = await self.client.post(
+            "/speak", json={"text": "hi", "open_gate": True}, headers=headers
+        )
+        payload = await response.json()
+        self.assertTrue(payload["gate_opened"])
+        self.assertEqual(payload["gate_reason"], "proactive_reply_armed")
+
+    async def test_gate_cardinality_and_non_enforced_reasons_are_success(self):
+        headers = {"Authorization": "Bearer secret"}
+        for result in (
+            (False, "no_active_connection"),
+            (False, "ambiguous_connections"),
+            (False, "gate_not_enforced"),
+        ):
+            self.gate_opener.return_value = result
+            response = await self.client.post(
+                "/speak", json={"text": "hi", "open_gate": True}, headers=headers
+            )
+            self.assertEqual(response.status, 200)
+            self.assertEqual((await response.json())["gate_reason"], result[1])
+
+    async def test_invalid_boolean_types(self):
+        headers = {"Authorization": "Bearer secret"}
+        for body in (
+            {"text": "hi", "open_gate": "true"},
+            {"text": "hi", "allow_tts_fallback": "false"},
+        ):
+            self.assertEqual((await self.client.post("/speak", json=body, headers=headers)).status, 400)
+        self.speaker.speak.assert_not_awaited()
+
+    async def test_fallback_disabled_failure_does_not_open_gate(self):
+        self.speaker.speak.side_effect = FallbackDisabledError("disabled")
+        response = await self.client.post(
+            "/speak",
+            json={"text": "hi", "open_gate": True, "allow_tts_fallback": False},
+            headers={"Authorization": "Bearer secret"},
+        )
+        payload = await response.json()
+        self.assertEqual(response.status, 502)
+        self.assertEqual(payload["reason"], "fallback_disabled")
+        self.assertFalse(payload["fallback_allowed"])
+        self.gate_opener.assert_not_awaited()
+
+    async def test_gate_opener_exception_still_returns_200_and_speaks_once(self):
+        self.gate_opener.side_effect = RuntimeError("boom")
+        response = await self.client.post(
+            "/speak",
+            json={"text": "hi", "open_gate": True, "allow_tts_fallback": False},
+            headers={"Authorization": "Bearer secret"},
+        )
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertEqual(payload["gate_reason"], "gate_open_failed")
+        self.assertFalse(payload["fallback_allowed"])
+        self.speaker.speak.assert_awaited_once()
+
+    async def test_gate_opener_timeout_error_is_not_mislabeled(self):
+        self.gate_opener.side_effect = TimeoutError("gate deadline")
+        response = await self.client.post(
+            "/speak",
+            json={"text": "hi", "open_gate": True},
+            headers={"Authorization": "Bearer secret"},
+        )
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        self.assertFalse(payload["gate_opened"])
+        self.assertEqual(payload["gate_reason"], "gate_open_timeout")
+        self.speaker.speak.assert_awaited_once()
+
+    async def test_gate_opener_timeout_still_returns_200_and_speaks_once(self):
+        async def slow_gate():
+            await asyncio.sleep(1)
+            return True, "late"
+
+        await self.client.close()
+        self.server = TestServer(create_speak_app(
+            self.speaker,
+            token="secret",
+            total_timeout_s=0.01,
+            gate_opener=slow_gate,
+        ))
+        self.client = TestClient(self.server)
+        await self.client.start_server()
+        response = await self.client.post(
+            "/speak",
+            json={"text": "hi", "open_gate": True},
+            headers={"Authorization": "Bearer secret"},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())["gate_reason"], "gate_open_timeout")
+        self.speaker.speak.assert_awaited_once()
 
     async def test_health_has_no_external_calls(self):
         response = await self.client.get("/health")

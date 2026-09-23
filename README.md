@@ -93,9 +93,10 @@ Reachy 社区唤醒模型来自 `andyjmorgan/reachy-wake-word`，采用 **CC BY-
 服务在 STT WebSocket 同一进程中另启 HTTP 监听（默认 `0.0.0.0:8766`）：
 
 - `GET /health`：只报告 adapter HTTP 服务存活，不访问 Reachy、火山或 daemon。
-- `POST /speak`：JSON 为 `{"text":"要播报的文本"}`；文本 trim 后不能为空，UTF-8 编码不超过 4000 字节。
-- 成功返回 `{"ok":true,"route":"conversation|daemon_tts","request_id":"..."}`。
-- 输入错误返回 400；鉴权失败返回 401；conversation 与 TTS/daemon 两条路径均失败或总超时返回 502。
+- `POST /speak`：JSON 为 `{"text":"要播报的文本","open_gate":true,"allow_tts_fallback":true}`；文本 trim 后不能为空，UTF-8 编码不超过 4000 字节。两个 option 都必须是 JSON boolean：`open_gate` 默认 `false`，`allow_tts_fallback` 默认 `true`；字符串 `"true"/"false"` 会返回 400。
+- 成功返回包含 `ok`、实际 `route`、`fallback_allowed`、`gate_requested/gate_opened/gate_reason` 和 `request_id`。`open_gate=true` 只在播报完整成功后生效：enforce 且恰有一个 live Reachy 连接时，为下一句回复开启现有 30 秒 speaker 窗口；0 个、多连接或 off/shadow 只返回对应 reason，不使成功播报失败。
+- `allow_tts_fallback=false` 时只调用 `conversation.say`；若 conversation 不可用则返回 502、`reason=fallback_disabled`，不会调用 Volc TTS/daemon，也不会开 gate。
+- 输入错误返回 400；鉴权失败返回 401；conversation 与 TTS/daemon 两条路径均失败或播报阶段总超时返回 502。播报成功后的 gate opening 超时/异常仍返回 200，避免 HA 重试造成重复播报。
 
 请求由进程内 `asyncio.Lock` 串行，且受 `SPEAK_TOTAL_TIMEOUT_SECONDS` 总超时约束。路由首先短连接 `REACHY_CONVERSATION_RPC_URL` 调用 `conversation.say`；只有收到匹配 JSON-RPC id 的成功 result 才结束。连接失败、`not_running` 或其他 RPC error 时，才使用 Seed-TTS 2.0 合成完整 MP3，上传 daemon 并调用 `play_sound`。conversation 成功时绝不会调用 TTS。上传文件使用唯一名称，播放成功后默认延迟 300 秒删除，避免播放中删除。
 
@@ -105,7 +106,7 @@ Reachy 社区唤醒模型来自 `andyjmorgan/reachy-wake-word`，采用 **CC BY-
 curl -sS http://127.0.0.1:8766/speak \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer ${SPEAK_API_TOKEN}" \
-  -d '{"text":"晚饭准备好了"}'
+  -d '{"text":"晚饭准备好了","open_gate":true,"allow_tts_fallback":true}'
 ```
 
 `SPEAK_API_TOKEN` 为空时允许可信内网免鉴权调用，并在进程生命周期内警告一次；非空时必须发送 Bearer token。请求体不能指定 daemon、conversation 或 TTS URL，避免形成 SSRF 入口。
@@ -123,12 +124,14 @@ rest_command:
     headers:
       authorization: "Bearer {{ token }}"
       content-type: "application/json"
-    payload: '{"text": {{ text | tojson }} }'
+    payload: '{"text": {{ text | tojson }}, "open_gate": {{ open_gate | default(false) | tojson }}, "allow_tts_fallback": {{ allow_tts_fallback | default(true) | tojson }} }'
 
 # automation/script 调用
 # action: rest_command.reachy_speak
 # data:
 #   text: "晚饭准备好了"
+#   open_gate: true
+#   allow_tts_fallback: true
 #   token: !secret reachy_speak_api_token
 ```
 

@@ -83,6 +83,9 @@ class AudioGate:
         self.wake: WakeMarker | None = None
         self.identity: tuple[int, str] | None = None
         self._deadline: float | None = None
+        # A proactive reply starts without SSD identity, but the wildcard is
+        # consumable by exactly one definite utterance.
+        self._proactive_reply_pending = False
 
     def _advance(self) -> None:
         now = self._clock()
@@ -93,6 +96,7 @@ class AudioGate:
                 self._deadline = expired_at + self.closing_seconds
                 self.wake = None
                 self.identity = None
+                self._proactive_reply_pending = False
             elif self.state is GateState.CLOSING:
                 self.state = GateState.SLEEPING
                 self._deadline = None
@@ -107,8 +111,29 @@ class AudioGate:
         self.wake = None
         self.identity = None
         self._deadline = None
+        self._proactive_reply_pending = False
 
     clear = reset
+
+    def arm_for_reply(self, stream_generation: int) -> bool:
+        """Authorize one proactive reply, binding its first SSD identity.
+
+        The generation must already be the gate's current stream generation;
+        this prevents a delayed HTTP request from authorizing a reconnected or
+        cleared stream.
+        """
+        self._advance()
+        if (
+            self.mode is not GateMode.ENFORCE
+            or self.stream_generation != stream_generation
+        ):
+            return False
+        self.wake = None
+        self.identity = None
+        self._proactive_reply_pending = True
+        self.state = GateState.ACTIVE
+        self._deadline = self._clock() + self.speaker_window_s
+        return True
 
     def on_wake(self, marker: WakeMarker) -> None:
         if self.mode is GateMode.OFF:
@@ -116,6 +141,7 @@ class AudioGate:
         self.stream_generation = marker.stream_generation
         self.wake = marker
         self.identity = None
+        self._proactive_reply_pending = False
         self.state = GateState.TRIGGERED
         self._deadline = self._clock() + self.trigger_timeout_s
 
@@ -165,6 +191,14 @@ class AudioGate:
             return self._result(True, "wake_bound_to_speaker", created=True)
 
         if self.state is GateState.ACTIVE:
+            if self._proactive_reply_pending:
+                self._proactive_reply_pending = False
+                if not utterance.speaker_id:
+                    self._enter_closing()
+                    return self._result(True, "proactive_reply_missing_speaker")
+                self.identity = (utterance.stream_generation, utterance.speaker_id)
+                self._deadline = self._clock() + self.speaker_window_s
+                return self._result(True, "proactive_reply_bound_to_speaker", created=True)
             identity = (
                 (utterance.stream_generation, utterance.speaker_id)
                 if utterance.speaker_id
@@ -183,4 +217,5 @@ class AudioGate:
         self.state = GateState.CLOSING
         self.wake = None
         self.identity = None
+        self._proactive_reply_pending = False
         self._deadline = self._clock() + self.closing_seconds

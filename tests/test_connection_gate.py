@@ -6,8 +6,10 @@ import json
 import unittest
 from types import SimpleNamespace
 
+from unittest.mock import AsyncMock
+
 from audio_gate import GateMode, Utterance, WakeMarker
-from volc_stt_adapter import RealtimeAdapterConnection
+from volc_stt_adapter import LiveConnectionRegistry, RealtimeAdapterConnection
 from wake_word import WakeEvent
 
 
@@ -119,6 +121,64 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(connection.stream)
         self.assertFalse(connection._stream_starting)
         self.assertEqual(bytes(connection._pending_stream_audio), b"")
+
+    async def test_proactive_open_starts_with_empty_pcm_not_detector_preroll(self):
+        connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
+        connection.detector = SimpleNamespace(sample_index=321, preroll_pcm=b"tts-echo")
+        stream = BlockingAudioStream()
+
+        async def start(initial_pcm, *, timeline_origin_sample):
+            self.assertEqual(initial_pcm, b"")
+            self.assertEqual(timeline_origin_sample, 321)
+            connection._on_stream_generation(stream.generation, timeline_origin_sample)
+            connection.stream = stream
+
+        connection._start_stream = start
+        self.assertTrue(await connection.arm_gate_for_reply())
+        self.assertEqual(stream.sent, [])
+        self.assertTrue(connection.gate._proactive_reply_pending)
+
+    async def test_proactive_open_reuses_existing_stream(self):
+        connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
+        stream = BlockingAudioStream()
+        connection.stream = stream
+        connection._on_stream_generation(1, 0)
+        connection._start_stream = AsyncMock()
+        self.assertTrue(await connection.arm_gate_for_reply())
+        connection._start_stream.assert_not_awaited()
+
+    async def test_proactive_start_clear_race_does_not_arm(self):
+        connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def start(initial_pcm, *, timeline_origin_sample):
+            entered.set()
+            await release.wait()
+
+        connection._start_stream = start
+        task = asyncio.create_task(connection.arm_gate_for_reply())
+        await entered.wait()
+        await connection.clear_audio(emit_confirmation=False)
+        release.set()
+        self.assertFalse(await task)
+        self.assertFalse(connection.gate._proactive_reply_pending)
+
+    async def test_registry_cardinality_mode_and_unregister(self):
+        registry = LiveConnectionRegistry("enforce")
+        self.assertEqual(await registry.open_gate(), (False, "no_active_connection"))
+        first = RealtimeAdapterConnection(Sink(), settings("enforce"))
+        first.arm_gate_for_reply = AsyncMock(return_value=True)
+        registry.register(first)
+        self.assertEqual(await registry.open_gate(), (True, "proactive_reply_armed"))
+        second = RealtimeAdapterConnection(Sink(), settings("enforce"))
+        registry.register(second)
+        self.assertEqual(await registry.open_gate(), (False, "ambiguous_connections"))
+        registry.unregister(second)
+        self.assertEqual(len(registry.snapshot()), 1)
+        off = LiveConnectionRegistry("off")
+        off.register(first)
+        self.assertEqual(await off.open_gate(), (False, "gate_not_enforced"))
 
     async def test_other_speaker_is_not_injected(self):
         downstream = Sink()

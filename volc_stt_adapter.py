@@ -16,6 +16,7 @@ import struct
 import time
 import uuid
 import wave
+import weakref
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
@@ -739,6 +740,7 @@ class RealtimeAdapterConnection:
         self._starting_stream: VolcengineStream | None = None
         self._lifecycle_generation = 0
         self._pcm_leftover = b""
+        self._closed = False
 
     async def emit(self, event_type: str, **fields: Any) -> None:
         event = {"event_id": f"event_{uuid.uuid4().hex}", "type": event_type, **fields}
@@ -870,6 +872,7 @@ class RealtimeAdapterConnection:
             except ConnectionClosed:
                 pass
         finally:
+            self._closed = True
             self.upstream = None
             await self.clear_audio(emit_confirmation=False)
             if self.detector:
@@ -1080,6 +1083,49 @@ class RealtimeAdapterConnection:
                 self._stream_starting = False
                 self._pending_stream_audio.clear()
 
+    async def arm_gate_for_reply(self) -> bool:
+        """Open the enforced gate after proactive speech has fully completed."""
+        if self.kws_mode is not GateMode.ENFORCE or self._closed:
+            return False
+        async with self._lifecycle_lock:
+            lifecycle_generation = self._lifecycle_generation
+            if self.stream is not None:
+                return self.gate.arm_for_reply(self.stream.generation)
+            async with self._pending_stream_audio_lock:
+                self._stream_starting = True
+        try:
+            origin = self.detector.sample_index if self.detector is not None else 0
+            # Empty initial PCM is intentional: detector preroll contains the TTS
+            # playback and must never be submitted as user audio.
+            await self._start_stream(b"", timeline_origin_sample=origin)
+            stale_stream = None
+            async with self._lifecycle_lock:
+                if self._closed or self._lifecycle_generation != lifecycle_generation:
+                    async with self._stream_lock:
+                        stale_stream = self.stream
+                        self.stream = None
+                        self.item_id = None
+                    self.gate.clear()
+                elif self.stream is None:
+                    return False
+                else:
+                    while True:
+                        async with self._pending_stream_audio_lock:
+                            if not self._pending_stream_audio:
+                                self._stream_starting = False
+                                break
+                            buffered = bytes(self._pending_stream_audio)
+                            self._pending_stream_audio.clear()
+                        await self.stream.send_audio(buffered)
+                    return self.gate.arm_for_reply(self.stream.generation)
+            if stale_stream is not None:
+                await self._close_stream_safely(stale_stream)
+            return False
+        finally:
+            async with self._pending_stream_audio_lock:
+                self._stream_starting = False
+                self._pending_stream_audio.clear()
+
     async def _on_native_utterance(self, utterance: Utterance) -> None:
         transcript = utterance.text.strip()
         if not transcript:
@@ -1175,7 +1221,39 @@ class RealtimeAdapterConnection:
         await self.emit("error", error={"type": "invalid_request_error", "code": code, "message": message})
 
 
-async def websocket_handler(websocket: ServerConnection, settings: Settings) -> None:
+class LiveConnectionRegistry:
+    """Weak registry used to target exactly one live Reachy connection."""
+
+    def __init__(self, mode: GateMode | str):
+        self.mode = GateMode(mode)
+        self._connections: weakref.WeakSet[RealtimeAdapterConnection] = weakref.WeakSet()
+
+    def register(self, connection: RealtimeAdapterConnection) -> None:
+        self._connections.add(connection)
+
+    def unregister(self, connection: RealtimeAdapterConnection) -> None:
+        self._connections.discard(connection)
+
+    def snapshot(self) -> tuple[RealtimeAdapterConnection, ...]:
+        return tuple(connection for connection in self._connections if not connection._closed)
+
+    async def open_gate(self) -> tuple[bool, str]:
+        if self.mode is not GateMode.ENFORCE:
+            return False, "gate_not_enforced"
+        connections = self.snapshot()
+        if not connections:
+            return False, "no_active_connection"
+        if len(connections) != 1:
+            return False, "ambiguous_connections"
+        opened = await connections[0].arm_gate_for_reply()
+        return (True, "proactive_reply_armed") if opened else (False, "connection_not_live")
+
+
+async def websocket_handler(
+    websocket: ServerConnection,
+    settings: Settings,
+    registry: LiveConnectionRegistry | None = None,
+) -> None:
     request_path = getattr(getattr(websocket, "request", None), "path", "")
     path = request_path.split("?", 1)[0]
     if path != settings.path:
@@ -1183,13 +1261,18 @@ async def websocket_handler(websocket: ServerConnection, settings: Settings) -> 
         return
     peer = getattr(websocket, "remote_address", None)
     LOG.info("Reachy connected: %s path=%s", peer, request_path)
+    connection = RealtimeAdapterConnection(websocket, settings)
+    if registry is not None:
+        registry.register(connection)
     try:
-        await RealtimeAdapterConnection(websocket, settings).run()
+        await connection.run()
     except Exception:
         LOG.exception("Connection handler failed for %s", peer)
         with contextlib.suppress(Exception):
             await websocket.close(code=1011, reason="Adapter error")
     finally:
+        if registry is not None:
+            registry.unregister(connection)
         LOG.info("Reachy disconnected: %s", peer)
 
 
@@ -1218,10 +1301,12 @@ async def run_servers(settings: Settings, stop: asyncio.Event) -> None:
             timeout_s=settings.daemon_sound_timeout_s,
         )
         speaker = ReachySpeaker(conversation, tts, daemon)
+        registry = LiveConnectionRegistry(settings.kws_mode)
         app = create_speak_app(
             speaker,
             token=settings.speak_api_token,
             total_timeout_s=settings.speak_total_timeout_s,
+            gate_opener=registry.open_gate,
         )
         runner = web.AppRunner(app)
         await runner.setup()
@@ -1234,7 +1319,7 @@ async def run_servers(settings: Settings, stop: asyncio.Event) -> None:
                 settings.speak_http_port,
             )
             async with serve(
-                lambda ws: websocket_handler(ws, settings),
+                lambda ws: websocket_handler(ws, settings, registry),
                 settings.host,
                 settings.port,
                 max_size=4 * 1024 * 1024,

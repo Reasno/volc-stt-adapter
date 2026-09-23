@@ -98,6 +98,32 @@ class AudioGateTest(unittest.TestCase):
         self.assertTrue(decision.enforce_allow)
         self.assertEqual(decision.reason, "mode_off")
 
+    def test_proactive_reply_binds_first_speaker_and_refreshes(self):
+        self.assertTrue(self.gate.arm_for_reply(1))
+        first = self.gate.decide(utterance(text="主动回复"))
+        self.assertTrue(first.allow)
+        self.assertEqual(first.reason, "proactive_reply_bound_to_speaker")
+        self.assertEqual(first.identity, (1, "alice"))
+        self.assertFalse(self.gate.decide(utterance(speaker="bob")).allow)
+        self.assertTrue(self.gate.decide(utterance()).authorization_refreshed)
+
+    def test_proactive_reply_missing_speaker_fails_closed(self):
+        self.assertTrue(self.gate.arm_for_reply(1))
+        first = self.gate.decide(utterance(speaker=None))
+        self.assertTrue(first.allow)
+        self.assertEqual(first.reason, "proactive_reply_missing_speaker")
+        self.assertEqual(first.state, GateState.CLOSING)
+        self.assertFalse(self.gate.decide(utterance()).allow)
+
+    def test_proactive_reply_expires_and_generation_reset_revokes(self):
+        self.assertTrue(self.gate.arm_for_reply(1))
+        self.clock.advance(30)
+        self.assertFalse(self.gate.decide(utterance()).allow)
+        self.gate.reset(2)
+        self.assertFalse(self.gate.arm_for_reply(1))
+        self.assertTrue(self.gate.arm_for_reply(2))
+        self.assertFalse(self.gate.decide(utterance(generation=1)).allow)
+
     def test_instances_do_not_share_authorization(self):
         other = AudioGate(mode="enforce", clock=self.clock); other.reset(1)
         self.wake(); self.assertTrue(self.gate.decide(utterance(text="gate1唤醒")).allow)
