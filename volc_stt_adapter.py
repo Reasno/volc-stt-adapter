@@ -321,7 +321,10 @@ class VolcengineStream:
         self.on_generation_reset = on_generation_reset
         self.generation = 0
         self.timeline_origin_sample = timeline_origin_sample
+        # Every accepted local PCM16 sample is accounted exactly once as sent
+        # or unsent. Unsent samples are not replayed, but still advance time.
         self.sent_samples = 0
+        self.unsent_samples = 0
         self.http: aiohttp.ClientSession | None = None
         self.ws: aiohttp.ClientWebSocketResponse | None = None
         self.sequence = 1
@@ -344,8 +347,11 @@ class VolcengineStream:
                 POS_SEQUENCE,
                 wav_chunk(initial_pcm, self.settings.sample_rate),
             )
+            samples = len(initial_pcm) // 2
             if sent:
-                self.sent_samples += len(initial_pcm) // 2
+                self.sent_samples += samples
+            else:
+                self.unsent_samples += samples
 
     async def _connect_upstream(self) -> None:
         """(Re)connect to Volcengine and send the initial full_request handshake.
@@ -372,11 +378,7 @@ class VolcengineStream:
         if self.http and not self.http.closed:
             with contextlib.suppress(Exception):
                 await self.http.close()
-        self.timeline_origin_sample += self.sent_samples
-        self.sent_samples = 0
-        self.generation += 1
-        self.on_generation_reset(self.generation, self.timeline_origin_sample)
-        self.sequence = 1
+        self._begin_generation()
         self.http = aiohttp.ClientSession(timeout=timeout)
         self.ws = await self.http.ws_connect(self.settings.volc_url, headers=headers, heartbeat=20)
         request = {
@@ -422,6 +424,15 @@ class VolcengineStream:
         await self.ws.send_bytes(frame)
         acknowledgement = await self._receive_one()
         self._raise_for_error(acknowledgement)
+
+    def _begin_generation(self) -> None:
+        """Advance origin by all local input consumed by the prior generation."""
+        self.timeline_origin_sample += self.sent_samples + self.unsent_samples
+        self.sent_samples = 0
+        self.unsent_samples = 0
+        self.generation += 1
+        self.on_generation_reset(self.generation, self.timeline_origin_sample)
+        self.sequence = 1
 
     def _record_reconnect(self) -> bool:
         """Return True if we may attempt another reconnect, respecting the rate limit."""
@@ -499,8 +510,13 @@ class VolcengineStream:
                 return False
 
     async def send_audio(self, pcm: bytes) -> None:
-        if not self._closed and await self._send(CLIENT_AUDIO_ONLY_REQUEST, POS_SEQUENCE, pcm):
-            self.sent_samples += len(pcm) // 2
+        if self._closed:
+            return
+        samples = len(pcm) // 2
+        if await self._send(CLIENT_AUDIO_ONLY_REQUEST, POS_SEQUENCE, pcm):
+            self.sent_samples += samples
+        else:
+            self.unsent_samples += samples
 
     async def finish(self) -> str:
         if self._closed:
@@ -676,7 +692,11 @@ class RealtimeAdapterConnection:
         self._pending_stream_audio = bytearray()
         self._pending_stream_audio_lock = asyncio.Lock()
         self._stream_lock = asyncio.Lock()
+        self._stream_close_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
+        self._starting_stream: VolcengineStream | None = None
+        self._lifecycle_generation = 0
+        self._pcm_leftover = b""
 
     async def emit(self, event_type: str, **fields: Any) -> None:
         event = {"event_id": f"event_{uuid.uuid4().hex}", "type": event_type, **fields}
@@ -853,10 +873,10 @@ class RealtimeAdapterConnection:
         except Exception:
             await self.error("invalid_request_error", "Invalid base64 audio")
             return
-        if not pcm:
-            return
-        if len(pcm) % 2:
-            pcm = pcm[:-1]
+        pcm = self._pcm_leftover + pcm
+        even_length = len(pcm) & ~1
+        self._pcm_leftover = pcm[even_length:]
+        pcm = pcm[:even_length]
         if not pcm:
             return
 
@@ -885,35 +905,74 @@ class RealtimeAdapterConnection:
     async def _start_stream(self, initial_pcm: bytes, *, timeline_origin_sample: int) -> None:
         async with self._stream_lock:
             if self.stream is not None:
-                if initial_pcm:
-                    await self.stream.send_audio(initial_pcm)
-                return
-            stream_id = f"stream_{uuid.uuid4().hex}"
-            self.item_id = stream_id
-            stream = VolcengineStream(
-                self.settings,
-                self.language,
-                stream_id,
-                self._on_native_utterance,
-                self._on_stream_generation,
-                timeline_origin_sample=timeline_origin_sample,
+                existing_stream = self.stream
+                starting_stream = None
+            else:
+                existing_stream = None
+                stream_id = f"stream_{uuid.uuid4().hex}"
+                starting_stream = VolcengineStream(
+                    self.settings,
+                    self.language,
+                    stream_id,
+                    self._on_native_utterance,
+                    self._on_stream_generation,
+                    timeline_origin_sample=timeline_origin_sample,
+                )
+                lifecycle_generation = self._lifecycle_generation
+                self._starting_stream = starting_stream
+                self.item_id = stream_id
+        if existing_stream is not None:
+            if initial_pcm:
+                await existing_stream.send_audio(initial_pcm)
+            return
+
+        assert starting_stream is not None
+        try:
+            await starting_stream.start(initial_pcm)
+        except BaseException:
+            await self._close_stream_safely(starting_stream)
+            async with self._stream_lock:
+                if self._starting_stream is starting_stream:
+                    self._starting_stream = None
+                if self.item_id == starting_stream.item_id:
+                    self.item_id = None
+            self.gate.reset()
+            raise
+
+        async with self._stream_lock:
+            publish = (
+                self._starting_stream is starting_stream
+                and self._lifecycle_generation == lifecycle_generation
             )
+            if publish:
+                self.stream = starting_stream
+                self._starting_stream = None
+            elif self._starting_stream is starting_stream:
+                self._starting_stream = None
+        if not publish:
+            # clear may have closed before start() actually acquired resources;
+            # close again after start returns. The close lock serializes overlap.
+            await self._close_stream_safely(starting_stream)
+            return
+        LOG.info(
+            "[%s] Volcengine stream started: generation=%d origin_sample=%d mode=%s",
+            starting_stream.item_id,
+            starting_stream.generation,
+            starting_stream.timeline_origin_sample,
+            self.kws_mode.value,
+        )
+
+    async def _close_stream_safely(self, stream: VolcengineStream) -> None:
+        """Serialize close and finish it even if the caller is cancelled."""
+        async with self._stream_close_lock:
+            close_task = asyncio.create_task(stream.close())
             try:
-                await stream.start(initial_pcm)
-                self.stream = stream
+                await asyncio.shield(close_task)
+            except asyncio.CancelledError:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await close_task
             except Exception:
-                await stream.close()
-                self.stream = None
-                self.item_id = None
-                self.gate.reset()
-                raise
-            LOG.info(
-                "[%s] Volcengine stream started: generation=%d origin_sample=%d mode=%s",
-                stream_id,
-                stream.generation,
-                stream.timeline_origin_sample,
-                self.kws_mode.value,
-            )
+                LOG.exception("Failed to close Volcengine stream %s", stream.item_id)
 
     def _on_stream_generation(self, generation: int, timeline_origin_sample: int) -> None:
         self.gate.reset(generation)
@@ -949,34 +1008,35 @@ class RealtimeAdapterConnection:
         self.gate.on_wake(WakeMarker(generation, event.sample_index, event.timestamp_ms))
 
     async def _start_after_wake(self, event: WakeEvent) -> None:
-        async with self._lifecycle_lock:
-            if self.stream is not None:
-                self.gate.on_wake(
-                    WakeMarker(self.stream.generation, event.sample_index, event.timestamp_ms)
-                )
-                return
-            self._pending_wake = event
-            async with self._pending_stream_audio_lock:
-                self._stream_starting = True
-            try:
-                origin = max(0, event.sample_index - len(event.preroll_pcm) // 2)
-                await self._start_stream(event.preroll_pcm, timeline_origin_sample=origin)
-                assert self.stream is not None
+        if self.stream is not None:
+            self.gate.on_wake(
+                WakeMarker(self.stream.generation, event.sample_index, event.timestamp_ms)
+            )
+            return
+        self._pending_wake = event
+        async with self._pending_stream_audio_lock:
+            self._stream_starting = True
+        try:
+            origin = max(0, event.sample_index - len(event.preroll_pcm) // 2)
+            # Startup is intentionally outside _lifecycle_lock so clear/finally
+            # can detach and close a stream whose start() is blocked.
+            await self._start_stream(event.preroll_pcm, timeline_origin_sample=origin)
+            async with self._lifecycle_lock:
+                if self.stream is None:
+                    return
                 while True:
                     async with self._pending_stream_audio_lock:
                         if not self._pending_stream_audio:
                             self._stream_starting = False
                             break
-                        # Atomic swap: data appended while send_audio awaits is
-                        # written to a fresh buffer and drained next round.
                         buffered = bytes(self._pending_stream_audio)
                         self._pending_stream_audio = bytearray()
                     await self.stream.send_audio(buffered)
-            finally:
-                self._pending_wake = None
-                async with self._pending_stream_audio_lock:
-                    self._stream_starting = False
-                    self._pending_stream_audio.clear()
+        finally:
+            self._pending_wake = None
+            async with self._pending_stream_audio_lock:
+                self._stream_starting = False
+                self._pending_stream_audio.clear()
 
     async def _on_native_utterance(self, utterance: Utterance) -> None:
         transcript = utterance.text.strip()
@@ -997,6 +1057,10 @@ class RealtimeAdapterConnection:
         if decision.reason == "trigger_utterance_missing_timeline":
             LOG.warning(
                 "Wake-matched first definite utterance has no usable timeline; allowing once without speaker authorization"
+            )
+        elif decision.reason == "trigger_utterance_missing_speaker":
+            LOG.warning(
+                "Wake-matched first definite utterance has no speaker; allowing once without speaker authorization"
             )
         if not decision.allow:
             return
@@ -1042,10 +1106,14 @@ class RealtimeAdapterConnection:
 
     async def clear_audio(self, *, emit_confirmation: bool = True) -> None:
         async with self._lifecycle_lock:
-            if self.stream:
-                await self.stream.close()
-            self.stream = None
-            self.item_id = None
+            async with self._stream_lock:
+                self._lifecycle_generation += 1
+                stream = self.stream
+                starting_stream = self._starting_stream
+                self.stream = None
+                self._starting_stream = None
+                self.item_id = None
+            self._pcm_leftover = b""
             self._pending_wake = None
             async with self._pending_stream_audio_lock:
                 self._stream_starting = False
@@ -1053,6 +1121,10 @@ class RealtimeAdapterConnection:
             self.gate.clear()
             if self.detector:
                 await self.detector.reset()
+        # Never hold lifecycle/stream locks while close waits on receiver/ws.
+        for candidate in (stream, starting_stream):
+            if candidate is not None:
+                await self._close_stream_safely(candidate)
         LOG.info("Audio cleared; stream, detector timeline, and KWS authorization reset")
         if emit_confirmation:
             await self.emit("input_audio_buffer.cleared")
