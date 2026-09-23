@@ -216,8 +216,8 @@ class AggregationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second.tts_cache_hit)
         tts.synthesize.assert_awaited_once_with("same", "r1")
         self.assertEqual(daemon.upload_and_play.await_count, 2)
-        self.assertIs(daemon.upload_and_play.await_args_list[0].args[0], b"audio")
-        self.assertIs(
+        self.assertEqual(daemon.upload_and_play.await_args_list[0].args[0], b"audio")
+        self.assertEqual(
             daemon.upload_and_play.await_args_list[0].args[0],
             daemon.upload_and_play.await_args_list[1].args[0],
         )
@@ -307,7 +307,7 @@ class AggregationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.tts_cache_hit)
         self.assertEqual(tts.synthesize.await_count, 2)
 
-    async def test_close_clears_cache(self):
+    async def test_close_does_not_clear_disk_cache(self):
         conversation = SimpleNamespace(say=AsyncMock(side_effect=ConversationError("offline")))
         tts = SimpleNamespace(
             synthesize=AsyncMock(return_value=b"audio"),
@@ -318,9 +318,39 @@ class AggregationTests(unittest.IsolatedAsyncioTestCase):
         daemon = SimpleNamespace(upload_and_play=AsyncMock(), close=AsyncMock())
         speaker = ReachySpeaker(conversation, tts, daemon)
         await speaker.speak("cached", "r1")
+        cached_dir = speaker.tts_cache.cache_dir
+        self.assertEqual(speaker.tts_cache.size, 1)
         await speaker.close()
-        self.assertEqual(speaker.tts_cache.size, 0)
+        # Disk cache must survive close so restarts can reuse audio.
+        self.assertEqual(speaker.tts_cache.size, 1)
+        self.assertTrue(any(cached_dir.iterdir()))
         daemon.close.assert_awaited_once()
+
+    async def test_disk_cache_persists_across_speaker_instances(self):
+        import tempfile
+        conversation = SimpleNamespace(say=AsyncMock(side_effect=ConversationError("offline")))
+        tts = SimpleNamespace(
+            synthesize=AsyncMock(return_value=b"audio-bytes"),
+            resource_id="resource",
+            voice="voice",
+            max_audio_bytes=100,
+        )
+        daemon = SimpleNamespace(upload_and_play=AsyncMock(), close=AsyncMock())
+        shared_dir = tempfile.mkdtemp(prefix="tts-cache-test-")
+
+        first = ReachySpeaker(conversation, tts, daemon, cache_dir=shared_dir)
+        first_result = await first.speak("hello", "r1")
+        self.assertFalse(first_result.tts_cache_hit)
+        await first.close()
+
+        tts.synthesize.reset_mock()
+        # Simulate process restart: brand-new speaker instance pointed at the
+        # same on-disk cache directory. The audio must be reused without
+        # calling synthesize again.
+        second = ReachySpeaker(conversation, tts, daemon, cache_dir=shared_dir)
+        second_result = await second.speak("hello", "r2")
+        self.assertTrue(second_result.tts_cache_hit)
+        tts.synthesize.assert_not_awaited()
 
 
 class TtsTests(unittest.IsolatedAsyncioTestCase):

@@ -14,10 +14,12 @@ import gzip
 import hashlib
 import json
 import logging
+import os
 import struct
+import tempfile
 import uuid
-from collections import OrderedDict
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock
 from typing import Any, Awaitable, Callable, Hashable
 
@@ -365,58 +367,129 @@ class DaemonSoundClient:
         self._cleanup_tasks.clear()
 
 
-class AudioLruCache:
-    """Small thread-safe LRU that retains immutable audio bytes by reference."""
+class DiskAudioLruCache:
+    """Thread-safe LRU that persists audio bytes to a directory.
 
-    def __init__(self, max_entries: int):
+    Each entry is a single file named ``<sha256(key)>.bin``; LRU order is
+    tracked by ``mtime`` so that survives process restarts. Corrupted or
+    unreadable entries are dropped silently and treated as misses so the
+    caller re-synthesizes.
+    """
+
+    _SUFFIX = ".bin"
+
+    def __init__(self, cache_dir: str | Path, max_entries: int):
         if max_entries < 0:
             raise ValueError("max_entries must be non-negative")
         self.max_entries = max_entries
-        self._items: OrderedDict[Hashable, bytes] = OrderedDict()
+        self.cache_dir = Path(cache_dir)
+        if max_entries > 0:
+            try:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                LOG.warning("TTS cache dir %s unusable: %s", self.cache_dir, exc)
         self._lock = Lock()
         self.hits = 0
         self.misses = 0
         self.evictions = 0
 
+    @staticmethod
+    def _stable_key(key: Hashable) -> str:
+        try:
+            raw = json.dumps(key, sort_keys=True, default=repr, ensure_ascii=False)
+        except TypeError:
+            raw = repr(key)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _path_for(self, key: Hashable) -> Path:
+        return self.cache_dir / (self._stable_key(key) + self._SUFFIX)
+
+    def _iter_entries(self) -> list[Path]:
+        try:
+            return [p for p in self.cache_dir.iterdir()
+                    if p.is_file() and p.suffix == self._SUFFIX]
+        except OSError:
+            return []
+
     def get(self, key: Hashable) -> bytes | None:
         with self._lock:
-            if self.max_entries == 0 or key not in self._items:
+            if self.max_entries == 0:
                 self.misses += 1
                 return None
-            audio = self._items.pop(key)
-            self._items[key] = audio
+            path = self._path_for(key)
+            try:
+                data = path.read_bytes()
+            except FileNotFoundError:
+                self.misses += 1
+                return None
+            except OSError as exc:
+                LOG.warning("TTS cache read failed for %s: %s", path.name, exc)
+                self.misses += 1
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                return None
+            # Touch mtime to mark most-recently-used.
+            with contextlib.suppress(OSError):
+                os.utime(path, None)
             self.hits += 1
-            return audio
+            return data
 
     def put(self, key: Hashable, audio: bytes) -> None:
         if self.max_entries == 0:
             return
         with self._lock:
-            if key in self._items:
-                self._items.pop(key)
-            self._items[key] = audio
-            while len(self._items) > self.max_entries:
-                self._items.popitem(last=False)
-                self.evictions += 1
+            path = self._path_for(key)
+            try:
+                self.cache_dir.mkdir(parents=True, exist_ok=True)
+                # Atomic write: tmpfile + rename inside the same dir.
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=".tmp-", suffix=".partial", dir=str(self.cache_dir)
+                )
+                try:
+                    with os.fdopen(fd, "wb") as fh:
+                        fh.write(audio)
+                    os.replace(tmp_name, path)
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp_name)
+                    raise
+            except OSError as exc:
+                LOG.warning("TTS cache write failed: %s", exc)
+                return
+            entries = self._iter_entries()
+            if len(entries) <= self.max_entries:
+                return
+            entries.sort(key=lambda p: (p.stat().st_mtime if p.exists() else 0))
+            overflow = len(entries) - self.max_entries
+            for victim in entries[:overflow]:
+                with contextlib.suppress(OSError):
+                    victim.unlink()
+                    self.evictions += 1
 
     def clear(self) -> None:
         with self._lock:
-            self._items.clear()
+            for entry in self._iter_entries():
+                with contextlib.suppress(OSError):
+                    entry.unlink()
 
     @property
     def size(self) -> int:
         with self._lock:
-            return len(self._items)
+            return len(self._iter_entries())
 
     @property
     def stats(self) -> dict[str, int]:
         with self._lock:
             return {
-                "size": len(self._items),
+                "size": len(self._iter_entries()),
                 "hits": self.hits,
                 "misses": self.misses,
                 "evictions": self.evictions,
             }
+
+
+# Backwards-compatible alias for older imports.
+AudioLruCache = DiskAudioLruCache
 
 
 class SpeakResult(str):
@@ -438,11 +511,16 @@ class ReachySpeaker:
         daemon: DaemonSoundClient,
         *,
         cache_entries: int = 100,
+        cache_dir: str | Path | None = None,
     ):
         self.conversation = conversation
         self.tts = tts
         self.daemon = daemon
-        self.tts_cache = AudioLruCache(cache_entries)
+        if cache_dir is None:
+            # Per-instance ephemeral dir (used by tests). Production callers
+            # MUST pass an explicit cache_dir so audio survives restarts.
+            cache_dir = tempfile.mkdtemp(prefix="volc-tts-cache-")
+        self.tts_cache = DiskAudioLruCache(cache_dir, cache_entries)
         self._lock = asyncio.Lock()
 
     def _tts_cache_key(self, text: str) -> Hashable:
@@ -492,7 +570,8 @@ class ReachySpeaker:
                 ) from fallback_error
 
     async def close(self) -> None:
-        self.tts_cache.clear()
+        # Do NOT clear the on-disk cache on shutdown: it must persist so
+        # subsequent restarts can reuse cached audio.
         await self.daemon.close()
 
 

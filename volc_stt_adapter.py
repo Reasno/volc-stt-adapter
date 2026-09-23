@@ -126,6 +126,7 @@ class Settings:
     speak_total_timeout_s: float
     volc_tts_max_audio_bytes: int
     volc_tts_cache_entries: int
+    volc_tts_cache_dir: str
     daemon_sound_timeout_s: float
     daemon_sound_cleanup_delay_s: float
 
@@ -225,6 +226,7 @@ class Settings:
                 "VOLC_TTS_MAX_AUDIO_BYTES", str(16 * 1024 * 1024), minimum=1
             ),
             volc_tts_cache_entries=integer("VOLC_TTS_CACHE_ENTRIES", "100", minimum=0),
+            volc_tts_cache_dir=os.getenv("VOLC_TTS_CACHE_DIR", "./data/tts_cache").strip(),
             daemon_sound_timeout_s=number(
                 "DAEMON_SOUND_TIMEOUT_SECONDS", "10", minimum=0.1
             ),
@@ -1305,6 +1307,7 @@ async def run_servers(settings: Settings, stop: asyncio.Event) -> None:
             tts,
             daemon,
             cache_entries=settings.volc_tts_cache_entries,
+            cache_dir=settings.volc_tts_cache_dir,
         )
         registry = LiveConnectionRegistry(settings.kws_mode)
         app = create_speak_app(

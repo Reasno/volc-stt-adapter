@@ -31,6 +31,8 @@ if ! getent passwd pollen >/dev/null; then
 fi
 
 install -d -o pollen -g pollen -m 0755 "${INSTALL_DIR}"
+install -d -o pollen -g pollen -m 0755 /var/cache/volc-stt-adapter
+install -d -o pollen -g pollen -m 0755 /var/cache/volc-stt-adapter/tts
 
 install_file() {
   local source=$1 destination=$2 mode=${3:-0644}
