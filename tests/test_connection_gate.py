@@ -53,6 +53,7 @@ def settings(mode):
         keyword_gate_enabled=True,
         keyword_gate_prefix_words=(),
         stop_talking_words=("闭嘴", "住嘴", "停嘴", "安静", "别说了", "停止", "停下", "够了"),
+        speaker_context_enabled=True,
     )
 
 

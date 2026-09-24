@@ -64,6 +64,7 @@ def _settings() -> SimpleNamespace:
         kws_match_tolerance_ms=100,
         keyword_gate_enabled=True,
         keyword_gate_prefix_words=(),
+        speaker_context_enabled=True,
     )
 
 

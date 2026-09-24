@@ -160,6 +160,7 @@ class Settings:
     keyword_gate_enabled: bool
     keyword_gate_prefix_words: tuple[str, ...]
     stop_talking_words: tuple[str, ...]
+    speaker_context_enabled: bool
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -290,6 +291,8 @@ class Settings:
             keyword_gate_enabled=keyword_gate_enabled,
             keyword_gate_prefix_words=keyword_gate_prefix_words,
             stop_talking_words=stop_talking_words,
+            speaker_context_enabled=os.getenv("SPEAKER_CONTEXT_ENABLED", "true").strip().lower()
+            in ("1", "true", "yes", "on"),
         )
 
 
@@ -433,6 +436,11 @@ class VolcengineStream:
         self.receiver: asyncio.Task[None] | None = None
         self.latest_text = ""
         self.last_emitted_text = ""
+        # Most recent Volcengine ASR speaker-perception context from utterance
+        # additions (speaker_id / gender / age / emotion). None until the first
+        # definite utterance carrying at least one recognized field. Only raw
+        # values are stored — no inference or family-member mapping is done here.
+        self.latest_speaker_context: dict[str, Any] | None = None
         self.error: Exception | None = None
         self._closed = False
         # Guard against send_audio racing with reconnect swap of self.ws.
@@ -502,6 +510,9 @@ class VolcengineStream:
                 "result_type": "single",
                 "enable_nonstream": True,
                 "enable_speaker_info": True,
+                "enable_gender_detection": True,
+                "enable_age_detection": True,
+                "enable_emotion_detection": True,
                 # ASR2.0 (Resource ID volc.seedasr.sauc.duration) + SSD 200
                 # 大模型 SSD 短对话聚类模式（<=5 人非会议场景）。ssd_mode=0
                 # 适用于 3 分钟以内短交互；ssd_version=200 是官方要求 speaker
@@ -526,6 +537,48 @@ class VolcengineStream:
         await self.ws.send_bytes(frame)
         acknowledgement = await self._receive_one()
         self._raise_for_error(acknowledgement)
+
+    def _maybe_update_speaker_context(
+        self,
+        utterance: dict[str, Any],
+        additions: Any,
+        speaker_id: str | None,
+    ) -> None:
+        """Record raw ASR speaker-perception fields from a definite utterance.
+
+        Only pulls `gender` / `age` / `emotion` (plus the already-resolved
+        `speaker_id`) verbatim from `additions` — or, defensively, from the
+        utterance itself for variants that flatten the schema. Missing or
+        blank fields are dropped; if nothing is recognized we leave the
+        previous context untouched. No inference, thresholding, or family-
+        member mapping happens here — the downstream LLM does that.
+        """
+        sources: list[dict[str, Any]] = []
+        if isinstance(additions, dict):
+            sources.append(additions)
+        sources.append(utterance)
+
+        def pick(key: str) -> Any:
+            for src in sources:
+                if key in src and src[key] not in (None, ""):
+                    return src[key]
+            return None
+
+        context: dict[str, Any] = {}
+        if speaker_id:
+            context["speaker_id"] = speaker_id
+        for key in ("gender", "age", "emotion"):
+            value = pick(key)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                cleaned = value.strip()
+                if cleaned:
+                    context[key] = cleaned
+            else:
+                context[key] = value
+        if context:
+            self.latest_speaker_context = context
 
     def _begin_generation(self) -> None:
         """Advance origin by all local input consumed by the prior generation."""
@@ -711,6 +764,7 @@ class VolcengineStream:
                                     raw = utterance.get("speaker_id")
                                     if raw is not None:
                                         speaker_id = str(raw).strip() or None
+                                self._maybe_update_speaker_context(utterance, additions, speaker_id)
                                 relative_start_ms, relative_end_ms = utterance_times_ms(utterance)
                                 origin_ms = self.timeline_origin_sample * 1000.0 / self.settings.sample_rate
                                 start_ms = (
@@ -1019,8 +1073,42 @@ class RealtimeAdapterConnection:
         turn_detection = input_audio.get("turn_detection")
         if isinstance(turn_detection, dict):
             self.turn_detection = turn_detection
+        self._maybe_inject_speaker_context(incoming)
         await self._send_upstream(message)
         LOG.info("Session forwarded: language=zh-CN turn_detection=%s", self.turn_detection.get("type"))
+
+    def _maybe_inject_speaker_context(self, session: dict[str, Any]) -> None:
+        """Append the latest raw ASR speaker context to `session.instructions`.
+
+        Idempotent: any previous `[Speaker context] ...` line we appended is
+        stripped before re-appending the freshest snapshot, so repeated
+        `session.update` calls never accumulate. If the feature is disabled
+        or no speaker context has been observed yet, we still strip any stale
+        line so we don't leak a previous session's context.
+        """
+        if "instructions" not in session:
+            # Client didn't touch instructions this update; leave it alone.
+            # (Upstream keeps the previously-negotiated instructions.)
+            return
+        raw = session.get("instructions")
+        base = raw if isinstance(raw, str) else ""
+        # Strip any prior context line(s) so we stay idempotent even if the
+        # client echoes back our previous injection.
+        stripped_lines = [
+            line for line in base.splitlines() if not line.startswith("[Speaker context]")
+        ]
+        base = "\n".join(stripped_lines).rstrip()
+
+        context = None
+        if self.settings.speaker_context_enabled and self.stream is not None:
+            context = self.stream.latest_speaker_context
+
+        if context:
+            fields = ", ".join(f"{k}: {v}" for k, v in context.items())
+            line = f"[Speaker context] {fields}"
+            session["instructions"] = f"{base}\n{line}" if base else line
+        else:
+            session["instructions"] = base
 
     async def handle_audio_append(self, message: dict[str, Any]) -> None:
         encoded = message.get("audio")
