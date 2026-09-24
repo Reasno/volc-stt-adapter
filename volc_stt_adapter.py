@@ -1530,6 +1530,13 @@ def main() -> None:
         level=os.getenv("LOG_LEVEL", "DEBUG").upper(),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # Silence noisy per-frame frames logged by the websockets library itself
+    # (e.g. `websockets.server < TEXT '{"type": "input_audio_buffer.append", ...}'`).
+    # Keep the root logger at DEBUG for our own modules; only bump the
+    # websockets library loggers up to WARNING.
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("websockets.server").setLevel(logging.WARNING)
+    logging.getLogger("websockets.client").setLevel(logging.WARNING)
     try:
         asyncio.run(async_main())
     except KeyboardInterrupt:
