@@ -93,8 +93,8 @@ Reachy 社区唤醒模型来自 `andyjmorgan/reachy-wake-word`，采用 **CC BY-
 服务在 STT WebSocket 同一进程中另启 HTTP 监听（默认 `0.0.0.0:8766`）：
 
 - `GET /health`：只报告 adapter HTTP 服务存活，不访问 Reachy、火山或 daemon。
-- `POST /speak`：JSON 为 `{"text":"要播报的文本","open_gate":true}`；文本 trim 后不能为空，UTF-8 编码不超过 4000 字节。`open_gate` 必须是 JSON boolean，默认 `false`。
-- 成功返回包含 `ok`、`route=conversation`、`gate_requested/gate_opened/gate_reason` 和 `request_id`。`open_gate=true` 只在播报完整成功后生效：enforce 且恰有一个 live Reachy 连接时，为下一句回复开启现有 30 秒 speaker 窗口；0 个、多连接或 off/shadow 只返回对应 reason，不使成功播报失败。
+- `POST /speak`：JSON 为 `{"text":"要播报的文本","bypass_gate":true}`；文本 trim 后不能为空，UTF-8 编码不超过 4000 字节。`bypass_gate` 必须是 JSON boolean，默认 `false`；旧参数 `open_gate` 继续兼容。
+- 成功返回包含 `ok`、`route=conversation`、`gate_requested/gate_opened/gate_reason` 和 `request_id`。`bypass_gate=true` 会在播报成功后同时绕过 KWS 与火山 transcript keyword gate：enforce 且恰有一个 live Reachy 连接时立即启动火山流，并将下一条任意说话人的 utterance 直接放行、绑定为活跃 speaker，随后进入正常 30 秒窗口。0 个、多连接或 off/shadow 只返回对应 reason，不使成功播报失败。
 - `/speak` 只调用 Reachy `conversation.say`；conversation 不可用或调用失败时返回 502，不再调用 Volc TTS 或 daemon `play_sound`。
 - 输入错误返回 400；播报阶段总超时返回 502。播报成功后的 gate opening 超时/异常仍返回 200，避免 HA 重试造成重复播报。
 
@@ -105,7 +105,7 @@ Reachy 社区唤醒模型来自 `andyjmorgan/reachy-wake-word`，采用 **CC BY-
 ```bash
 curl -sS http://127.0.0.1:8766/speak \
   -H 'Content-Type: application/json' \
-  -d '{"text":"晚饭准备好了","open_gate":true}'
+  -d '{"text":"晚饭准备好了","bypass_gate":true}'
 ```
 
 `/health` 与 `/speak` 均供可信内网直接访问。请求体不能指定 daemon、conversation 或 TTS URL，避免形成 SSRF 入口。
@@ -122,13 +122,13 @@ rest_command:
     method: POST
     headers:
       content-type: "application/json"
-    payload: '{"text": {{ text | tojson }}, "open_gate": {{ open_gate | default(false) | tojson }} }'
+    payload: '{"text": {{ text | tojson }}, "bypass_gate": {{ bypass_gate | default(false) | tojson }} }'
 
 # automation/script 调用
 # action: rest_command.reachy_speak
 # data:
 #   text: "晚饭准备好了"
-#   open_gate: true
+#   bypass_gate: true
 ```
 
 ### 环境变量

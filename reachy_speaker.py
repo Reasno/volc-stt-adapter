@@ -540,9 +540,13 @@ def create_speak_app(
         except (json.JSONDecodeError, ValueError):
             return web.json_response({"ok": False, "error": "request body must be JSON", "route": None, "request_id": request_id}, status=400)
         text = body.get("text") if isinstance(body, dict) else None
-        open_gate = body.get("open_gate", False) if isinstance(body, dict) else False
-        if not isinstance(open_gate, bool):
+        bypass_gate = body.get("bypass_gate", False) if isinstance(body, dict) else False
+        legacy_open_gate = body.get("open_gate", False) if isinstance(body, dict) else False
+        if not isinstance(bypass_gate, bool):
+            return web.json_response({"ok": False, "error": "bypass_gate must be a JSON boolean", "route": None, "request_id": request_id}, status=400)
+        if not isinstance(legacy_open_gate, bool):
             return web.json_response({"ok": False, "error": "open_gate must be a JSON boolean", "route": None, "request_id": request_id}, status=400)
+        gate_requested = bypass_gate or legacy_open_gate
         if not isinstance(text, str) or not text.strip():
             return web.json_response({"ok": False, "error": "text must be a non-empty string", "route": None, "request_id": request_id}, status=400)
         text = text.strip()
@@ -554,7 +558,7 @@ def create_speak_app(
                 route = await speaker.speak(text, request_id)
                 gate_opened = False
                 gate_reason = "not_requested"
-                if open_gate:
+                if gate_requested:
                     if gate_opener is None:
                         gate_reason = "no_active_connection"
                     else:
@@ -569,7 +573,7 @@ def create_speak_app(
                 "ok": True,
                 "route": route,
                 "request_id": request_id,
-                "gate_requested": open_gate,
+                "gate_requested": gate_requested,
                 "gate_opened": gate_opened,
                 "gate_reason": gate_reason,
             })
@@ -579,13 +583,13 @@ def create_speak_app(
                     "ok": True,
                     "route": route,
                     "request_id": request_id,
-                    "gate_requested": open_gate,
+                    "gate_requested": gate_requested,
                     "gate_opened": False,
                     "gate_reason": "gate_open_timeout",
                 })
             return web.json_response({"ok": False, "error": "speech request timed out", "route": None, "request_id": request_id}, status=502)
         except SpeakerError as exc:
-            return web.json_response({"ok": False, "error": str(exc), "route": None, "gate_requested": open_gate, "gate_opened": False, "gate_reason": "speech_failed", "request_id": request_id}, status=502)
+            return web.json_response({"ok": False, "error": str(exc), "route": None, "gate_requested": gate_requested, "gate_opened": False, "gate_reason": "speech_failed", "request_id": request_id}, status=502)
 
     app.router.add_get("/health", health)
     app.router.add_post("/speak", speak)

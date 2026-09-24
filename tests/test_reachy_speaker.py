@@ -125,25 +125,35 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.post("/speak", json={"text": "  "})).status, 400)
         self.assertEqual((await self.client.post("/speak", json={"text": "中文中文"})).status, 400)
 
-    async def test_open_gate(self):
+    async def test_bypass_gate(self):
         response = await self.client.post(
-            "/speak", json={"text": "hi", "open_gate": True}
+            "/speak", json={"text": "hi", "bypass_gate": True}
         )
         payload = await response.json()
+        self.assertTrue(payload["gate_requested"])
         self.assertTrue(payload["gate_opened"])
         self.assertEqual(payload["gate_reason"], "proactive_reply_armed")
 
-    async def test_invalid_open_gate_type(self):
+    async def test_legacy_open_gate_is_still_supported(self):
         response = await self.client.post(
-            "/speak", json={"text": "hi", "open_gate": "true"}
+            "/speak", json={"text": "hi", "open_gate": True}
         )
-        self.assertEqual(response.status, 400)
+        self.assertEqual(response.status, 200)
+        self.assertTrue((await response.json())["gate_opened"])
+
+    async def test_invalid_gate_types(self):
+        for body in (
+            {"text": "hi", "bypass_gate": "true"},
+            {"text": "hi", "open_gate": "true"},
+        ):
+            response = await self.client.post("/speak", json=body)
+            self.assertEqual(response.status, 400)
         self.speaker.speak.assert_not_awaited()
 
     async def test_conversation_failure_does_not_open_gate(self):
         self.speaker.speak.side_effect = SpeakerError("conversation.say failed: offline")
         response = await self.client.post(
-            "/speak", json={"text": "hi", "open_gate": True}
+            "/speak", json={"text": "hi", "bypass_gate": True}
         )
         payload = await response.json()
         self.assertEqual(response.status, 502)
