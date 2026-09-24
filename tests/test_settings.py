@@ -25,6 +25,35 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual(settings.volc_tts_resource_id, "seed-tts-2.0")
         self.assertEqual(settings.volc_tts_voice, "zh_female_vv_uranus_bigtts")
         self.assertEqual(settings.volc_tts_cache_entries, 100)
+        # Feature 1 default: 30s stream idle window (KWS-wake → back to KWS wait).
+        self.assertEqual(settings.stream_idle_timeout_seconds, 30.0)
+
+    def test_stream_idle_timeout_env_override(self):
+        with patch.dict(
+            os.environ,
+            {**BASE_ENV, "STREAM_IDLE_TIMEOUT_SECONDS": "45"},
+            clear=True,
+        ):
+            settings = Settings.from_environment()
+        self.assertEqual(settings.stream_idle_timeout_seconds, 45.0)
+
+    def test_stream_idle_timeout_zero_disables_watchdog(self):
+        with patch.dict(
+            os.environ,
+            {**BASE_ENV, "STREAM_IDLE_TIMEOUT_SECONDS": "0"},
+            clear=True,
+        ):
+            settings = Settings.from_environment()
+        self.assertEqual(settings.stream_idle_timeout_seconds, 0.0)
+
+    def test_stream_idle_timeout_negative_is_rejected(self):
+        with patch.dict(
+            os.environ,
+            {**BASE_ENV, "STREAM_IDLE_TIMEOUT_SECONDS": "-1"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "STREAM_IDLE_TIMEOUT_SECONDS"):
+                Settings.from_environment()
 
     def test_invalid_mode_and_fractional_queue_are_rejected(self):
         with patch.dict(os.environ, {**BASE_ENV, "KWS_MODE": "enabled"}, clear=True):

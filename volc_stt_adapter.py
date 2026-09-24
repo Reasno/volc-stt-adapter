@@ -162,6 +162,7 @@ class Settings:
     stop_talking_words: tuple[str, ...]
     speaker_context_enabled: bool
     speaker_context_window_seconds: float
+    stream_idle_timeout_seconds: float
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -296,6 +297,9 @@ class Settings:
             in ("1", "true", "yes", "on"),
             speaker_context_window_seconds=number(
                 "SPEAKER_CONTEXT_WINDOW_SECONDS", "30", minimum=0.0
+            ),
+            stream_idle_timeout_seconds=number(
+                "STREAM_IDLE_TIMEOUT_SECONDS", "30", minimum=0.0
             ),
         )
 
@@ -898,11 +902,17 @@ class RealtimeAdapterConnection:
         # Monotonic-clock deadline (0.0 = disarmed).
         self._keyword_gate_wildcard_deadline: float = 0.0
         # Soft-close watchdog: closes the Volcengine stream as soon as no
-        # speaker window in _keyword_gate_speakers is still active. On stream
-        # start we grant an initial grace period (KEYWORD_GATE_WINDOW_S) so the
-        # very first utterance after the KWS wake has time to arrive.
+        # user speech (STT final) or bot response.done arrives within
+        # STREAM_IDLE_TIMEOUT_SECONDS. This is a stream/connection-level idle
+        # timer, independent of the text gate's per-speaker admission window.
+        # `_stream_idle_deadline` is a monotonic-clock deadline (0.0 = disarmed);
+        # refreshed on every ASR final utterance (see _refresh_stream_idle) and
+        # on every upstream response.done/response.cancelled event.
         self._stream_watchdog_task: asyncio.Task | None = None
-        self._stream_watchdog_grace_deadline: float = 0.0
+        self._stream_idle_deadline: float = 0.0
+        self._stream_idle_timeout_s: float = float(
+            getattr(settings, "stream_idle_timeout_seconds", 30.0)
+        )
         self._stream_starting = False
         self._pending_stream_audio = bytearray()
         self._pending_stream_audio_lock = asyncio.Lock()
@@ -955,7 +965,26 @@ class RealtimeAdapterConnection:
     async def _send_upstream(self, message: dict[str, Any]) -> None:
         if self.upstream is None:
             raise RuntimeError("Upstream Realtime connection is not ready")
+        # Feature 2 (方案 A): Right before we forward a `response.create` upstream
+        # — whether it was bounced from the client or generated locally by the
+        # native-VAD text gate — push a preceding `session.update` that stamps
+        # the freshest speaker-context line onto the client-negotiated
+        # `instructions`. The two frames must go out atomically under the send
+        # lock so no other coroutine can interleave a session.update between
+        # them. Both frames are then persisted upstream in order. If no fresh
+        # speaker context is available we pass the response.create through
+        # untouched. `handle_session_update` also keeps its own injection path
+        # (see `_maybe_inject_speaker_context`) as a fallback for clients that
+        # re-send instructions on every turn.
+        if isinstance(message, dict) and message.get("type") == "response.create":
+            session_update = self._build_speaker_context_session_update()
+        else:
+            session_update = None
         async with self._upstream_send_lock:
+            if session_update is not None:
+                await self.upstream.send(
+                    json.dumps(session_update, ensure_ascii=False)
+                )
             await self.upstream.send(json.dumps(message, ensure_ascii=False))
 
     async def _downstream_loop(self) -> None:
@@ -1032,6 +1061,11 @@ class RealtimeAdapterConnection:
                 # window without a refreshing utterance will inject nothing.
                 if self.stream is not None:
                     self.stream.arm_speaker_context_expiration()
+                # Bot just finished talking — count that as activity for the
+                # stream idle timer (Feature 1) so the user has the full
+                # STREAM_IDLE_TIMEOUT_SECONDS to respond before the stream is
+                # torn down.
+                self._refresh_stream_idle()
             if event_type.startswith("conversation.item.input_audio_transcription."):
                 LOG.debug("Suppressing upstream transcription event: %s", event_type)
                 continue
@@ -1127,8 +1161,70 @@ class RealtimeAdapterConnection:
         await self._send_upstream(message)
         LOG.info("Session forwarded: language=zh-CN turn_detection=%s", self.turn_detection.get("type"))
 
+    def _build_instructions_with_speaker_context(self, base: str) -> str:
+        """Return `base` with any prior `[Speaker context]` line stripped and,
+        if a fresh context is available, the current snapshot re-appended.
+
+        Idempotent: safe to call repeatedly on the same string. Returns just
+        the stripped base when the feature is disabled or context has expired.
+        """
+        base = base if isinstance(base, str) else ""
+        stripped = "\n".join(
+            line for line in base.splitlines() if not line.startswith("[Speaker context]")
+        ).rstrip()
+
+        context = None
+        if self.settings.speaker_context_enabled and self.stream is not None:
+            context = self.stream.speaker_context_if_fresh()
+        if not context:
+            return stripped
+        fields = ", ".join(f"{k}: {v}" for k, v in context.items())
+        line = f"[Speaker context] {fields}"
+        return f"{stripped}\n{line}" if stripped else line
+
+    def _build_speaker_context_session_update(
+        self,
+    ) -> dict[str, Any] | None:
+        """Build a `session.update` frame that appends a `[Speaker context]`
+        line to the client's most recent `instructions`, or return None when
+        there's nothing fresh to inject.
+
+        Format (per Feature 2 spec):
+
+            {original instructions}\\n\\n[Speaker context] speaker_id: X, gender: Y, age: Z.Z, emotion: W
+
+        The client's original instructions are preserved verbatim; any prior
+        `[Speaker context]` line already stamped on the tracked base is stripped
+        first so repeated calls stay idempotent. Returns None when the feature
+        is disabled, no VolcengineStream is attached, or
+        `speaker_context_if_fresh()` reports no fresh snapshot.
+        """
+        if not self.settings.speaker_context_enabled or self.stream is None:
+            return None
+        context = self.stream.speaker_context_if_fresh()
+        if not context:
+            return None
+        base = self.session.get("instructions", "") or ""
+        stripped = "\n".join(
+            line for line in base.splitlines() if not line.startswith("[Speaker context]")
+        ).rstrip()
+        fields = ", ".join(f"{k}: {v}" for k, v in context.items())
+        line = f"[Speaker context] {fields}"
+        instructions = f"{stripped}\n\n{line}" if stripped else line
+        return {
+            "type": "session.update",
+            "event_id": f"event_{uuid.uuid4().hex}",
+            "session": {"instructions": instructions},
+        }
+
     def _maybe_inject_speaker_context(self, session: dict[str, Any]) -> None:
         """Append the latest raw ASR speaker context to `session.instructions`.
+
+        Fallback path — the main injection now happens right before
+        `response.create` is sent upstream (see
+        `_build_speaker_context_session_update`, Feature 2 方案 A). This
+        session.update path still runs for clients that push fresh
+        instructions on every turn, so they see the same behavior as before.
 
         Idempotent: any previous `[Speaker context] ...` line we appended is
         stripped before re-appending the freshest snapshot, so repeated
@@ -1140,25 +1236,9 @@ class RealtimeAdapterConnection:
             # Client didn't touch instructions this update; leave it alone.
             # (Upstream keeps the previously-negotiated instructions.)
             return
-        raw = session.get("instructions")
-        base = raw if isinstance(raw, str) else ""
-        # Strip any prior context line(s) so we stay idempotent even if the
-        # client echoes back our previous injection.
-        stripped_lines = [
-            line for line in base.splitlines() if not line.startswith("[Speaker context]")
-        ]
-        base = "\n".join(stripped_lines).rstrip()
-
-        context = None
-        if self.settings.speaker_context_enabled and self.stream is not None:
-            context = self.stream.speaker_context_if_fresh()
-
-        if context:
-            fields = ", ".join(f"{k}: {v}" for k, v in context.items())
-            line = f"[Speaker context] {fields}"
-            session["instructions"] = f"{base}\n{line}" if base else line
-        else:
-            session["instructions"] = base
+        session["instructions"] = self._build_instructions_with_speaker_context(
+            session.get("instructions", "")
+        )
 
     async def handle_audio_append(self, message: dict[str, Any]) -> None:
         encoded = message.get("audio")
@@ -1436,6 +1516,11 @@ class RealtimeAdapterConnection:
         transcript = utterance.text.strip()
         if not transcript:
             return
+        # An ASR final has arrived — this counts as user speech activity for
+        # the stream idle timer (Feature 1). Refresh even when the text gate
+        # ends up rejecting the utterance; the goal is "someone is still
+        # talking near the mic → keep the stream open".
+        self._refresh_stream_idle()
 
         # Hard stop-talking interception. Matched anywhere in the transcript,
         # runs before the keep-alive gate so that even a stale/ambiguous window
@@ -1563,11 +1648,14 @@ class RealtimeAdapterConnection:
         return None
 
     def _arm_stream_idle(self) -> None:
-        """Start the soft-close watchdog for a freshly published stream."""
-        # Give the newly opened stream a grace window so the first-ever
-        # utterance after the KWS wake (which is what created this stream) has
-        # a chance to arrive and open a speaker window.
-        self._stream_watchdog_grace_deadline = time.monotonic() + KEYWORD_GATE_WINDOW_S
+        """Start (or re-arm) the stream idle watchdog for a freshly published
+        stream. The initial deadline gives the first-ever ASR utterance after
+        the KWS wake a chance to arrive; every subsequent activity event
+        (`_refresh_stream_idle`) pushes the deadline forward.
+        """
+        if self._stream_idle_timeout_s <= 0:
+            return
+        self._stream_idle_deadline = time.monotonic() + self._stream_idle_timeout_s
         task = self._stream_watchdog_task
         if task is not None and not task.done():
             return
@@ -1575,28 +1663,34 @@ class RealtimeAdapterConnection:
             self._stream_idle_watchdog(), name="volc-stream-idle-watchdog"
         )
 
-    def _next_active_speaker_deadline(self) -> float:
-        """Return the keep-alive window deadline (0.0 if not active)."""
-        return self._keyword_gate_wildcard_deadline
+    def _refresh_stream_idle(self) -> None:
+        """Bump the stream idle deadline. Called on:
+        * every ASR final utterance (user speech activity), and
+        * every upstream `response.done` / `response.cancelled` (bot answer end).
+
+        No-op when the feature is disabled (timeout=0) or no stream is
+        currently open / starting.
+        """
+        if self._stream_idle_timeout_s <= 0:
+            return
+        if self.stream is None and not self._stream_starting:
+            return
+        self._stream_idle_deadline = time.monotonic() + self._stream_idle_timeout_s
 
     async def _stream_idle_watchdog(self) -> None:
         try:
             while True:
                 now = time.monotonic()
-                speaker_deadline = self._next_active_speaker_deadline()
-                grace_deadline = self._stream_watchdog_grace_deadline
-                # "Active speaker exists" == some speaker window not yet expired.
-                # While inside the initial grace, treat that grace as an active
-                # window so the first-ever utterance has time to arrive.
-                deadline = max(speaker_deadline, grace_deadline)
+                deadline = self._stream_idle_deadline
                 if deadline <= now:
                     break
                 await asyncio.sleep(deadline - now)
             if self._closed or self.stream is None:
                 return
             LOG.info(
-                "No active speaker window (grace expired, keyword_gate empty); "
-                "soft-closing Volcengine stream"
+                "Stream idle timeout: no ASR final or response.done activity "
+                "for %.1fs; soft-closing Volcengine stream (back to KWS wait)",
+                self._stream_idle_timeout_s,
             )
             await self.clear_audio(emit_confirmation=False)
         except asyncio.CancelledError:
@@ -1605,7 +1699,7 @@ class RealtimeAdapterConnection:
             LOG.exception("Stream idle watchdog failed")
 
     def _cancel_stream_idle(self) -> None:
-        self._stream_watchdog_grace_deadline = 0.0
+        self._stream_idle_deadline = 0.0
         task = self._stream_watchdog_task
         self._stream_watchdog_task = None
         if task is not None and not task.done():

@@ -30,6 +30,7 @@ def _settings(speaker_context_enabled: bool = True) -> SimpleNamespace:
         stop_talking_words=(),
         speaker_context_enabled=speaker_context_enabled,
         speaker_context_window_seconds=30,
+        stream_idle_timeout_seconds=30,
     )
 
 
@@ -201,6 +202,128 @@ class InjectSpeakerContextTest(unittest.IsolatedAsyncioTestCase):
             "[Speaker context] speaker_id: 0, gender: male",
             forwarded["session"]["instructions"],
         )
+
+
+class InjectIntoResponseCreateTest(unittest.IsolatedAsyncioTestCase):
+    """Feature 2 (方案 A): on every `response.create`, `_send_upstream` must
+    push a preceding `session.update` carrying the freshest speaker-context
+    line, then forward the `response.create` frame untouched.
+    """
+
+    def _fresh_upstream(self):
+        import asyncio as _asyncio
+
+        upstream = SimpleNamespace(send=AsyncMock())
+        return upstream, _asyncio.Lock()
+
+    def _make_conn(self, *, context=None, enabled=True):
+        """Like the module-level `_make_connection` but without the
+        `_send_upstream` shadow-mock, since these tests exercise the real
+        `_send_upstream` and observe `conn.upstream.send`.
+        """
+        conn = RealtimeAdapterConnection(SimpleNamespace(), _settings(enabled))
+        if context is not None:
+            conn.stream = _FakeStream(context)  # type: ignore[assignment]
+        return conn
+
+    async def test_response_create_prepended_by_session_update(self):
+        conn = self._make_conn(
+            context={"speaker_id": "0", "gender": "male"}
+        )
+        conn.session = {"instructions": "You are Reachy."}
+        conn.upstream, conn._upstream_send_lock = self._fresh_upstream()
+        msg = {"type": "response.create", "event_id": "x"}
+        await conn._send_upstream(msg)
+        # Two frames sent, in order: session.update then response.create.
+        self.assertEqual(conn.upstream.send.await_count, 2)
+        first, second = conn.upstream.send.await_args_list
+        first_frame = json.loads(first.args[0])
+        second_frame = json.loads(second.args[0])
+        self.assertEqual(first_frame["type"], "session.update")
+        self.assertEqual(
+            first_frame["session"]["instructions"],
+            "You are Reachy.\n\n[Speaker context] speaker_id: 0, gender: male",
+        )
+        # response.create passes through untouched (no per-response override).
+        self.assertEqual(second_frame["type"], "response.create")
+        self.assertNotIn("response", second_frame)
+
+    async def test_response_create_no_context_passes_through(self):
+        conn = self._make_conn(context=None)
+        conn.session = {"instructions": "You are Reachy."}
+        conn.upstream, conn._upstream_send_lock = self._fresh_upstream()
+        msg = {"type": "response.create", "event_id": "x"}
+        await conn._send_upstream(msg)
+        # No fresh context → NO preceding session.update, just the response.create.
+        conn.upstream.send.assert_awaited_once()
+        forwarded = json.loads(conn.upstream.send.await_args.args[0])
+        self.assertEqual(forwarded["type"], "response.create")
+        self.assertNotIn("response", forwarded)
+        # msg not mutated.
+        self.assertNotIn("response", msg)
+
+    async def test_response_create_disabled_via_settings(self):
+        conn = self._make_conn(
+            context={"speaker_id": "0"}, enabled=False
+        )
+        conn.session = {"instructions": "Base."}
+        conn.upstream, conn._upstream_send_lock = self._fresh_upstream()
+        msg = {"type": "response.create", "event_id": "x"}
+        await conn._send_upstream(msg)
+        # Feature disabled → no session.update injected, just the response.create.
+        conn.upstream.send.assert_awaited_once()
+        forwarded = json.loads(conn.upstream.send.await_args.args[0])
+        self.assertEqual(forwarded["type"], "response.create")
+
+    async def test_response_create_no_client_instructions_yet(self):
+        """Before the client sends its first session.update we still stamp a
+        bare `[Speaker context] ...` line (no empty prefix)."""
+        conn = self._make_conn(context={"speaker_id": "0", "gender": "male"})
+        conn.session = {}  # no `instructions` key
+        conn.upstream, conn._upstream_send_lock = self._fresh_upstream()
+        msg = {"type": "response.create"}
+        await conn._send_upstream(msg)
+        self.assertEqual(conn.upstream.send.await_count, 2)
+        first = json.loads(conn.upstream.send.await_args_list[0].args[0])
+        self.assertEqual(first["type"], "session.update")
+        self.assertEqual(
+            first["session"]["instructions"],
+            "[Speaker context] speaker_id: 0, gender: male",
+        )
+
+    async def test_response_create_repeated_is_idempotent(self):
+        """Repeated response.create with the same tracked base must not
+        accumulate stacked `[Speaker context]` lines in the emitted
+        session.update."""
+        conn = self._make_conn(context={"speaker_id": "0"})
+        conn.session = {
+            "instructions": "Base.\n[Speaker context] speaker_id: 9",
+        }
+        conn.upstream, conn._upstream_send_lock = self._fresh_upstream()
+        await conn._send_upstream({"type": "response.create"})
+        await conn._send_upstream({"type": "response.create"})
+        # 2 response.create × 2 frames each = 4 sends.
+        self.assertEqual(conn.upstream.send.await_count, 4)
+        for i in (0, 2):
+            frame = json.loads(
+                conn.upstream.send.await_args_list[i].args[0]
+            )
+            self.assertEqual(frame["type"], "session.update")
+            self.assertEqual(
+                frame["session"]["instructions"],
+                "Base.\n\n[Speaker context] speaker_id: 0",
+            )
+
+    async def test_non_response_create_frames_pass_through_without_extra(self):
+        conn = self._make_conn(context={"speaker_id": "0"})
+        conn.session = {"instructions": "Base."}
+        conn.upstream, conn._upstream_send_lock = self._fresh_upstream()
+        msg = {"type": "conversation.item.create", "item": {}}
+        await conn._send_upstream(msg)
+        conn.upstream.send.assert_awaited_once()
+        forwarded = json.loads(conn.upstream.send.await_args.args[0])
+        self.assertEqual(forwarded["type"], "conversation.item.create")
+        self.assertNotIn("response", msg)
 
 
 class SpeakerContextExpirationTest(unittest.TestCase):
