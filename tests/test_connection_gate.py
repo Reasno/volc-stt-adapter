@@ -3,13 +3,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 import unittest
 from types import SimpleNamespace
 
 from unittest.mock import AsyncMock
 
 from audio_gate import GateMode, Utterance, WakeMarker
-from volc_stt_adapter import LiveConnectionRegistry, RealtimeAdapterConnection
+from volc_stt_adapter import KEYWORD_GATE_WINDOW_S, LiveConnectionRegistry, RealtimeAdapterConnection
 from wake_word import WakeEvent
 
 
@@ -62,6 +63,10 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         upstream = Sink(); connection.upstream = upstream
         connection._on_stream_generation(7, 0)
         connection.gate.on_wake(WakeMarker(7, 16000, 1000))
+        # KWS wake also arms the post-stream keep-alive window (production
+        # does this inside _start_after_wake / arm_gate_for_reply); the test
+        # constructs the connection state manually so we mirror it here.
+        connection._keyword_gate_wildcard_deadline = time.monotonic() + KEYWORD_GATE_WINDOW_S
         await connection._on_native_utterance(
             Utterance("瑞奇 请打开客厅灯", "speaker-a", 7, 850, 1400)
         )
