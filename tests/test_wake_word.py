@@ -62,6 +62,23 @@ class WakeWordDetectorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([event.sample_index for event in events], [FRAME_SAMPLES])
         await detector.close()
 
+    async def test_logs_every_inferred_frame_score_at_debug(self):
+        detector = WakeWordDetector(
+            "model.onnx",
+            queue_frames=4,
+            model_factory=lambda: FakeModel(scores=[0.0, 0.0123456, 0.9]),
+        )
+        await detector.start()
+        with self.assertLogs("volc_stt_adapter.kws", level="DEBUG") as captured:
+            detector.append(bytes(FRAME_BYTES * 3))
+            await detector._queue.join()
+        score_lines = [line for line in captured.output if "KWS score:" in line]
+        self.assertEqual(len(score_lines), 3)
+        self.assertIn("0.000000 amp_peak=0 sample_index=1280 threshold=0.500", score_lines[0])
+        self.assertIn("0.012346 amp_peak=0 sample_index=2560 threshold=0.500", score_lines[1])
+        self.assertIn("0.900000 amp_peak=0 sample_index=3840 threshold=0.500", score_lines[2])
+        await detector.close()
+
     async def test_connections_do_not_share_model_state(self):
         models = []
         def factory():
