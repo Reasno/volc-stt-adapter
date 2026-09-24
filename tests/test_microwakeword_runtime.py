@@ -30,9 +30,11 @@ class FakeFrontend:
         self.calls_received = 0
         self.feature_index = 0
         self.reset_count = 0
+        self.last_chunks: list[bytes] = []
 
     def process_samples(self, chunk: bytes):
         self.calls_received += 1
+        self.last_chunks.append(bytes(chunk))
         result = _FrontendResult(samples_read=_FEATURE_HOP_SAMPLES, features=())
         if self.calls_received <= self.warmup_hops:
             return result
@@ -158,6 +160,60 @@ class MicroWakeWordModelTest(unittest.TestCase):
             self._build_model(step_ms=25)  # not a multiple of 10
         with self.assertRaises(ValueError):
             self._build_model(step_ms=0)
+
+    def test_input_gain_scales_pcm_before_feature_extraction(self):
+        # Feed one hop of a low-amplitude constant PCM signal; the gain must
+        # be applied before the microfrontend sees the bytes, and out-of-range
+        # values must be clipped to int16 min/max instead of wrapping.
+        frontend = FakeFrontend()
+        interpreter = FakeInterpreter(feature_slices=1, scores=[0.0])
+        model = MicroWakeWordModel(
+            Path("fake.tflite"),
+            cutoff=0.5,
+            sliding_window=1,
+            step_ms=10,
+            input_gain=6.0,
+            interpreter_factory=lambda: interpreter,
+            frontend_factory=lambda: frontend,
+        )
+        # Values chosen so 100 * 6 fits (=600) but 6000 * 6 = 36000 must clip
+        # to int16 max 32767.
+        samples = np.array([100, -100, 6000, -6000] * (_FEATURE_HOP_SAMPLES // 4), dtype=np.int16)
+        model.predict(samples)
+        seen = np.frombuffer(frontend.last_chunks[-1], dtype=np.int16)
+        self.assertEqual(int(seen[0]), 600)
+        self.assertEqual(int(seen[1]), -600)
+        self.assertEqual(int(seen[2]), 32767)
+        self.assertEqual(int(seen[3]), -32768)
+
+    def test_input_gain_default_is_identity(self):
+        frontend = FakeFrontend()
+        interpreter = FakeInterpreter(feature_slices=1, scores=[0.0])
+        model = MicroWakeWordModel(
+            Path("fake.tflite"),
+            cutoff=0.5,
+            sliding_window=1,
+            step_ms=10,
+            interpreter_factory=lambda: interpreter,
+            frontend_factory=lambda: frontend,
+        )
+        samples = np.array([100, -100] * (_FEATURE_HOP_SAMPLES // 2), dtype=np.int16)
+        model.predict(samples)
+        seen = np.frombuffer(frontend.last_chunks[-1], dtype=np.int16)
+        self.assertEqual(int(seen[0]), 100)
+        self.assertEqual(int(seen[1]), -100)
+
+    def test_input_gain_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            MicroWakeWordModel(
+                Path("fake.tflite"),
+                cutoff=0.5,
+                sliding_window=1,
+                step_ms=10,
+                input_gain=0.0,
+                interpreter_factory=lambda: FakeInterpreter(feature_slices=1, scores=[0.0]),
+                frontend_factory=lambda: FakeFrontend(),
+            )
 
     def test_stride_matches_step_ms(self):
         # step_ms=40, feature_hop=10 → stride_features=4.

@@ -78,6 +78,7 @@ class MicroWakeWordModel:
         cutoff: float = 0.95,
         sliding_window: int = 5,
         step_ms: int = 40,
+        input_gain: float = 1.0,
         interpreter_factory: Callable[[], Any] | None = None,
         frontend_factory: Callable[[], Any] | None = None,
     ) -> None:
@@ -89,12 +90,15 @@ class MicroWakeWordModel:
             )
         if not 0.0 <= cutoff <= 1.0:
             raise ValueError("cutoff must be in [0, 1]")
+        if input_gain <= 0.0:
+            raise ValueError("input_gain must be positive")
 
         self.model_path = Path(tflite_model_path)
         self.wakeword_name = wakeword_name or self.model_path.stem
         self.cutoff = cutoff
         self.sliding_window_size = sliding_window
         self.step_ms = step_ms
+        self.input_gain = float(input_gain)
         self.stride_features = step_ms // _FEATURE_MS_PER_HOP
 
         self._frontend_factory = frontend_factory or self._default_frontend
@@ -178,6 +182,9 @@ class MicroWakeWordModel:
 
         if samples.dtype != np.int16:
             samples = samples.astype(np.int16, copy=False)
+        if self.input_gain != 1.0 and samples.size:
+            boosted = samples.astype(np.int32, copy=False) * self.input_gain
+            samples = np.clip(boosted, np.iinfo(np.int16).min, np.iinfo(np.int16).max).astype(np.int16)
         pcm = samples.tobytes()
         if pcm:
             self._pcm_pending.extend(pcm)
@@ -338,6 +345,12 @@ def build_microwakeword_model(
         step_ms = int(os.getenv("KWS_MICROWAKEWORD_STEP_MS", "40"))
     except ValueError as exc:
         raise RuntimeError("KWS_MICROWAKEWORD_STEP_MS must be an integer") from exc
+    try:
+        input_gain = float(os.getenv("KWS_MICROWAKEWORD_INPUT_GAIN", "1.0"))
+    except ValueError as exc:
+        raise RuntimeError("KWS_MICROWAKEWORD_INPUT_GAIN must be a float") from exc
+    if input_gain <= 0.0:
+        raise RuntimeError("KWS_MICROWAKEWORD_INPUT_GAIN must be positive")
     wakeword_name = os.getenv("KWS_WAKEWORD_NAME", "").strip() or None
     return MicroWakeWordModel(
         model_path,
@@ -345,4 +358,5 @@ def build_microwakeword_model(
         cutoff=cutoff,
         sliding_window=sliding_window,
         step_ms=step_ms,
+        input_gain=input_gain,
     )
