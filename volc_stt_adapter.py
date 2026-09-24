@@ -25,13 +25,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from aiohttp import web
 from audio_gate import AudioGate, GateMode, Utterance, WakeMarker
-from reachy_speaker import (
-    ConversationSayClient,
-    DaemonSoundClient,
-    ReachySpeaker,
-    VolcengineTtsClient,
-    create_speak_app,
-)
+from reachy_speaker import ConversationSayClient, ReachySpeaker, create_speak_app
 from wake_word import SAMPLE_RATE, WakeEvent, WakeWordDetector
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import ServerConnection, serve
@@ -1479,29 +1473,7 @@ async def run_servers(settings: Settings, stop: asyncio.Event) -> None:
             http, settings.reachy_conversation_rpc_url,
             timeout_s=min(5.0, settings.speak_total_timeout_s),
         )
-        tts = VolcengineTtsClient(
-            http,
-            url=settings.volc_tts_url,
-            app_id=settings.app_key,
-            access_key=settings.access_key,
-            resource_id=settings.volc_tts_resource_id,
-            voice=settings.volc_tts_voice,
-            timeout_s=settings.volc_tts_timeout_s,
-            max_audio_bytes=settings.volc_tts_max_audio_bytes,
-        )
-        daemon = DaemonSoundClient(
-            http,
-            settings.reachy_daemon_url,
-            cleanup_delay_s=settings.daemon_sound_cleanup_delay_s,
-            timeout_s=settings.daemon_sound_timeout_s,
-        )
-        speaker = ReachySpeaker(
-            conversation,
-            tts,
-            daemon,
-            cache_entries=settings.volc_tts_cache_entries,
-            cache_dir=settings.volc_tts_cache_dir,
-        )
+        speaker = ReachySpeaker(conversation)
         registry = LiveConnectionRegistry(settings.kws_mode)
         app = create_speak_app(
             speaker,

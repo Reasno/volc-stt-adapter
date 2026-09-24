@@ -504,75 +504,21 @@ class SpeakResult(str):
 
 
 class ReachySpeaker:
-    def __init__(
-        self,
-        conversation: ConversationSayClient,
-        tts: VolcengineTtsClient,
-        daemon: DaemonSoundClient,
-        *,
-        cache_entries: int = 100,
-        cache_dir: str | Path | None = None,
-    ):
+    def __init__(self, conversation: ConversationSayClient):
         self.conversation = conversation
-        self.tts = tts
-        self.daemon = daemon
-        if cache_dir is None:
-            # Per-instance ephemeral dir (used by tests). Production callers
-            # MUST pass an explicit cache_dir so audio survives restarts.
-            cache_dir = tempfile.mkdtemp(prefix="volc-tts-cache-")
-        self.tts_cache = DiskAudioLruCache(cache_dir, cache_entries)
         self._lock = asyncio.Lock()
 
-    def _tts_cache_key(self, text: str) -> Hashable:
-        key_factory = getattr(self.tts, "cache_key", None)
-        if callable(key_factory):
-            return key_factory(text)
-        return (
-            getattr(self.tts, "resource_id", None),
-            getattr(self.tts, "voice", None),
-            text,
-        )
-
-    async def speak(
-        self,
-        text: str,
-        request_id: str,
-        *,
-        allow_tts_fallback: bool = True,
-    ) -> SpeakResult:
+    async def speak(self, text: str, request_id: str) -> SpeakResult:
         async with self._lock:
-            conversation_failure = "unknown"
             try:
                 await self.conversation.say(text)
-                LOG.info("Speech route ready: request_id=%s route=conversation tts_cache_hit=false", request_id)
-                return SpeakResult("conversation")
-            except ConversationError as conversation_error:
-                conversation_failure = str(conversation_error)
-                if not allow_tts_fallback:
-                    raise FallbackDisabledError(
-                        f"conversation.say failed and TTS fallback is disabled: {conversation_failure}"
-                    ) from conversation_error
-                LOG.info("conversation.say unavailable; using daemon TTS fallback: %s", conversation_failure)
-            try:
-                cache_key = self._tts_cache_key(text)
-                audio = self.tts_cache.get(cache_key)
-                cache_hit = audio is not None
-                if audio is None:
-                    audio = await self.tts.synthesize(text, request_id)
-                    if audio and len(audio) <= getattr(self.tts, "max_audio_bytes", len(audio)):
-                        self.tts_cache.put(cache_key, audio)
-                LOG.info("TTS fallback ready: request_id=%s tts_cache_hit=%s", request_id, cache_hit)
-                await self.daemon.upload_and_play(audio, request_id)
-                return SpeakResult("daemon_tts", tts_cache_hit=cache_hit)
-            except Exception as fallback_error:
-                raise SpeakerError(
-                    f"both speech routes failed: conversation={conversation_failure}; fallback={fallback_error}"
-                ) from fallback_error
+            except ConversationError as exc:
+                raise SpeakerError(f"conversation.say failed: {exc}") from exc
+            LOG.info("Speech route ready: request_id=%s route=conversation", request_id)
+            return SpeakResult("conversation")
 
     async def close(self) -> None:
-        # Do NOT clear the on-disk cache on shutdown: it must persist so
-        # subsequent restarts can reuse cached audio.
-        await self.daemon.close()
+        return None
 
 
 def create_speak_app(
@@ -592,29 +538,20 @@ def create_speak_app(
         try:
             body = await request.json()
         except (json.JSONDecodeError, ValueError):
-            return web.json_response({"ok": False, "error": "request body must be JSON", "route": None, "tts_cache_hit": False, "fallback_allowed": True, "request_id": request_id}, status=400)
+            return web.json_response({"ok": False, "error": "request body must be JSON", "route": None, "request_id": request_id}, status=400)
         text = body.get("text") if isinstance(body, dict) else None
         open_gate = body.get("open_gate", False) if isinstance(body, dict) else False
-        allow_tts_fallback = (
-            body.get("allow_tts_fallback", True) if isinstance(body, dict) else True
-        )
         if not isinstance(open_gate, bool):
-            return web.json_response({"ok": False, "error": "open_gate must be a JSON boolean", "route": None, "tts_cache_hit": False, "fallback_allowed": allow_tts_fallback if isinstance(allow_tts_fallback, bool) else True, "request_id": request_id}, status=400)
-        if not isinstance(allow_tts_fallback, bool):
-            return web.json_response({"ok": False, "error": "allow_tts_fallback must be a JSON boolean", "route": None, "tts_cache_hit": False, "fallback_allowed": True, "request_id": request_id}, status=400)
+            return web.json_response({"ok": False, "error": "open_gate must be a JSON boolean", "route": None, "request_id": request_id}, status=400)
         if not isinstance(text, str) or not text.strip():
-            return web.json_response({"ok": False, "error": "text must be a non-empty string", "route": None, "tts_cache_hit": False, "fallback_allowed": allow_tts_fallback, "request_id": request_id}, status=400)
+            return web.json_response({"ok": False, "error": "text must be a non-empty string", "route": None, "request_id": request_id}, status=400)
         text = text.strip()
         if len(text.encode("utf-8")) > max_text_bytes:
-            return web.json_response({"ok": False, "error": f"text exceeds {max_text_bytes} UTF-8 bytes", "route": None, "tts_cache_hit": False, "fallback_allowed": allow_tts_fallback, "request_id": request_id}, status=400)
+            return web.json_response({"ok": False, "error": f"text exceeds {max_text_bytes} UTF-8 bytes", "route": None, "request_id": request_id}, status=400)
         route: str | None = None
         try:
             async with asyncio.timeout(total_timeout_s):
-                route = await speaker.speak(
-                    text,
-                    request_id,
-                    allow_tts_fallback=allow_tts_fallback,
-                )
+                route = await speaker.speak(text, request_id)
                 gate_opened = False
                 gate_reason = "not_requested"
                 if open_gate:
@@ -631,9 +568,7 @@ def create_speak_app(
             return web.json_response({
                 "ok": True,
                 "route": route,
-                "tts_cache_hit": bool(getattr(route, "tts_cache_hit", False)),
                 "request_id": request_id,
-                "fallback_allowed": allow_tts_fallback,
                 "gate_requested": open_gate,
                 "gate_opened": gate_opened,
                 "gate_reason": gate_reason,
@@ -643,18 +578,14 @@ def create_speak_app(
                 return web.json_response({
                     "ok": True,
                     "route": route,
-                    "tts_cache_hit": bool(getattr(route, "tts_cache_hit", False)),
                     "request_id": request_id,
-                    "fallback_allowed": allow_tts_fallback,
                     "gate_requested": open_gate,
                     "gate_opened": False,
                     "gate_reason": "gate_open_timeout",
                 })
-            return web.json_response({"ok": False, "error": "speech request timed out", "route": None, "tts_cache_hit": False, "fallback_allowed": allow_tts_fallback, "request_id": request_id}, status=502)
-        except FallbackDisabledError as exc:
-            return web.json_response({"ok": False, "error": str(exc), "reason": exc.reason, "route": None, "tts_cache_hit": False, "fallback_allowed": False, "gate_requested": open_gate, "gate_opened": False, "gate_reason": "speech_failed", "request_id": request_id}, status=502)
+            return web.json_response({"ok": False, "error": "speech request timed out", "route": None, "request_id": request_id}, status=502)
         except SpeakerError as exc:
-            return web.json_response({"ok": False, "error": str(exc), "route": None, "tts_cache_hit": False, "fallback_allowed": allow_tts_fallback, "gate_requested": open_gate, "gate_opened": False, "gate_reason": "speech_failed", "request_id": request_id}, status=502)
+            return web.json_response({"ok": False, "error": str(exc), "route": None, "gate_requested": open_gate, "gate_opened": False, "gate_reason": "speech_failed", "request_id": request_id}, status=502)
 
     app.router.add_get("/health", health)
     app.router.add_post("/speak", speak)
