@@ -712,6 +712,12 @@ class VolcengineStream:
     @staticmethod
     def _raise_for_error(response: dict[str, Any]) -> None:
         if response["message_type"] == SERVER_ERROR_RESPONSE or response["code"]:
+            # 45000081 = "Timeout waiting next packet": Volcengine closes the
+            # session after ~8s of silence with no more audio packets. Treat
+            # this as a normal end-of-session signal, not an error.
+            if response.get("code") == 45000081:
+                LOG.info("Volcengine session ended normally (code=45000081, timeout waiting next packet)")
+                return
             raise RuntimeError(f"Volcengine ASR error: code={response['code']} payload={response['payload']}")
 
     @staticmethod
