@@ -1,11 +1,14 @@
-"""Feature 1: Stream idle timeout (30s post-KWS conversation window).
+"""Stream idle timeout watchdog.
 
 Verifies that:
 * `_arm_stream_idle()` seeds the deadline from `stream_idle_timeout_seconds`
   and starts the background watchdog.
 * `_refresh_stream_idle()` bumps the deadline forward on activity.
-* An `_on_native_utterance` call refreshes the idle deadline.
+* The VolcengineStream `on_activity` hook (any ASR text frame) refreshes the
+  idle deadline.
 * An upstream `response.done` event refreshes the idle deadline.
+* The watchdog keeps the stream alive while `upstream_response_active` is True
+  (bot answers longer than the timeout do not idle-close the stream).
 * `STREAM_IDLE_TIMEOUT_SECONDS=0` disables the mechanism entirely.
 """
 from __future__ import annotations
@@ -17,7 +20,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from audio_gate import GateMode, Utterance
+from audio_gate import GateMode
 from volc_stt_adapter import RealtimeAdapterConnection
 
 
@@ -82,15 +85,15 @@ class StreamIdleRefreshTest(unittest.IsolatedAsyncioTestCase):
         conn._refresh_stream_idle()
         self.assertEqual(conn._stream_idle_deadline, 0.0)
 
-    async def test_on_native_utterance_refreshes_idle(self):
+    async def test_on_activity_hook_refreshes_idle(self):
+        """VolcengineStream's on_activity callback (any ASR text frame,
+        partial or final) must refresh the idle deadline."""
         conn = await self._make_connection(30.0)
         conn._stream_starting = True
         before = time.monotonic()
-        # Empty transcript short-circuits BEFORE refresh; feed a real one.
-        await conn._on_native_utterance(
-            Utterance("你好", "speaker-a", 1, 100, 400)
-        )
-        # The refresh must fire even if the text gate later rejects the line.
+        # Directly invoke the callback that the adapter passes to
+        # VolcengineStream(on_activity=self._refresh_stream_idle).
+        conn._refresh_stream_idle()
         self.assertGreaterEqual(conn._stream_idle_deadline, before + 29.0)
 
     async def test_upstream_response_done_refreshes_idle(self):
@@ -148,6 +151,28 @@ class StreamIdleRefreshTest(unittest.IsolatedAsyncioTestCase):
         conn = await self._make_connection(0.0)
         conn._arm_stream_idle()
         self.assertIsNone(conn._stream_watchdog_task)
+
+    async def test_watchdog_keeps_stream_open_during_bot_response(self):
+        """While `upstream_response_active` is True the watchdog must not
+        tear down the stream even if the deadline expires — long bot answers
+        (>timeout) must survive."""
+        conn = await self._make_connection(0.05)  # 50ms so the test is fast
+        conn.clear_audio = AsyncMock()  # type: ignore[assignment]
+        conn.upstream_response_active = True
+        conn._arm_stream_idle()
+
+        # Wait long enough for several idle intervals to elapse.
+        await asyncio.sleep(0.2)
+        conn.clear_audio.assert_not_called()
+
+        # Once the bot finishes, the next idle interval must trigger teardown.
+        conn.upstream_response_active = False
+        for _ in range(20):
+            if conn.clear_audio.await_count:
+                break
+            await asyncio.sleep(0.05)
+        conn.clear_audio.assert_awaited_once_with(emit_confirmation=False)
+        conn._cancel_stream_idle()
 
 
 if __name__ == "__main__":

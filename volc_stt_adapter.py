@@ -394,12 +394,14 @@ class VolcengineStream:
         on_generation_reset: Callable[[int, int], None],
         *,
         timeline_origin_sample: int,
+        on_activity: Callable[[], None] | None = None,
     ):
         self.settings = settings
         self.language = language
         self.item_id = stream_id
         self.on_definite = on_definite
         self.on_generation_reset = on_generation_reset
+        self.on_activity = on_activity
         self.generation = 0
         self.timeline_origin_sample = timeline_origin_sample
         # Every accepted local PCM16 sample is accounted exactly once as sent
@@ -763,6 +765,8 @@ class VolcengineStream:
                             text = str(result.get("text") or "").strip()
                             if text:
                                 self.latest_text = text
+                                if self.on_activity is not None:
+                                    self.on_activity()
                             utterances = result.get("utterances") or []
                             for utterance in utterances:
                                 if not isinstance(utterance, dict) or not utterance.get("definite"):
@@ -865,13 +869,14 @@ class RealtimeAdapterConnection:
         # is accepting ASR utterances. Opened by KWS wake / proactive reply
         # arming; closed by stop-talking or stream teardown.
         self._conversation_gate_open: bool = False
-        # Soft-close watchdog: closes the Volcengine stream as soon as no
-        # user speech (STT final) or bot response.done arrives within
-        # STREAM_IDLE_TIMEOUT_SECONDS. This is a stream/connection-level idle
-        # timer, independent of the text gate's per-speaker admission window.
-        # `_stream_idle_deadline` is a monotonic-clock deadline (0.0 = disarmed);
-        # refreshed on every ASR final utterance (see _refresh_stream_idle) and
-        # on every upstream response.done/response.cancelled event.
+        # Soft-close watchdog: closes the Volcengine stream when no activity
+        # (user speech or bot response) has been observed for
+        # STREAM_IDLE_TIMEOUT_SECONDS. `_stream_idle_deadline` is a
+        # monotonic-clock deadline (0.0 = disarmed); refreshed on every ASR
+        # text frame (partial or final) and on every upstream response.done /
+        # response.cancelled. While `upstream_response_active` is True the
+        # watchdog also re-arms the deadline itself so long assistant answers
+        # never idle-close the stream.
         self._stream_watchdog_task: asyncio.Task | None = None
         self._stream_idle_deadline: float = 0.0
         self._stream_idle_timeout_s: float = float(
@@ -1025,10 +1030,9 @@ class RealtimeAdapterConnection:
                 # window without a refreshing utterance will inject nothing.
                 if self.stream is not None:
                     self.stream.arm_speaker_context_expiration()
-                # Bot just finished talking — count that as activity for the
-                # stream idle timer (Feature 1) so the user has the full
-                # STREAM_IDLE_TIMEOUT_SECONDS to respond before the stream is
-                # torn down.
+                # Bot just finished talking — restart the idle countdown so
+                # the user has the full STREAM_IDLE_TIMEOUT_SECONDS to respond
+                # before the stream is torn down.
                 self._refresh_stream_idle()
             if event_type.startswith("conversation.item.input_audio_transcription."):
                 LOG.debug("Suppressing upstream transcription event: %s", event_type)
@@ -1258,6 +1262,7 @@ class RealtimeAdapterConnection:
                     self._on_native_utterance,
                     self._on_stream_generation,
                     timeline_origin_sample=timeline_origin_sample,
+                    on_activity=self._refresh_stream_idle,
                 )
                 lifecycle_generation = self._lifecycle_generation
                 self._starting_stream = starting_stream
@@ -1473,11 +1478,6 @@ class RealtimeAdapterConnection:
         transcript = utterance.text.strip()
         if not transcript:
             return
-        # An ASR final has arrived — this counts as user speech activity for
-        # the stream idle timer (Feature 1). Refresh even when the text gate
-        # ends up rejecting the utterance; the goal is "someone is still
-        # talking near the mic → keep the stream open".
-        self._refresh_stream_idle()
 
         # Hard stop-talking interception. Matched anywhere in the transcript,
         # runs before the gate so an emergency stop cannot be swallowed. Tears
@@ -1611,8 +1611,8 @@ class RealtimeAdapterConnection:
 
     def _refresh_stream_idle(self) -> None:
         """Bump the stream idle deadline. Called on:
-        * every ASR final utterance (user speech activity), and
-        * every upstream `response.done` / `response.cancelled` (bot answer end).
+        * every ASR text frame (partial or final) via VolcengineStream on_activity,
+        * every upstream `response.done` / `response.cancelled`.
 
         No-op when the feature is disabled (timeout=0) or no stream is
         currently open / starting.
@@ -1628,9 +1628,16 @@ class RealtimeAdapterConnection:
             while True:
                 now = time.monotonic()
                 deadline = self._stream_idle_deadline
-                if deadline <= now:
-                    break
-                await asyncio.sleep(deadline - now)
+                if deadline > now:
+                    await asyncio.sleep(deadline - now)
+                    continue
+                # Bot is still talking: hold the stream open and re-arm the
+                # deadline. The user has the full timeout to respond only
+                # after response.done / response.cancelled fires.
+                if self.upstream_response_active:
+                    self._stream_idle_deadline = now + self._stream_idle_timeout_s
+                    continue
+                break
             if self._closed or self.stream is None:
                 return
             LOG.info(
