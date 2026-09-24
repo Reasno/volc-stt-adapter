@@ -757,6 +757,11 @@ class VolcengineStream:
                 while True:
                     response = await self._receive_one()
                     self._raise_for_error(response)
+                    # Any frame from Volcengine (even an empty heartbeat)
+                    # proves the session is alive; refresh the adapter's idle
+                    # watchdog so it doesn't tear down the stream mid-turn.
+                    if self.on_activity is not None:
+                        self.on_activity()
                     payload = response.get("payload")
                     if isinstance(payload, dict):
                         result = payload.get("result")
@@ -765,8 +770,6 @@ class VolcengineStream:
                             text = str(result.get("text") or "").strip()
                             if text:
                                 self.latest_text = text
-                                if self.on_activity is not None:
-                                    self.on_activity()
                             utterances = result.get("utterances") or []
                             for utterance in utterances:
                                 if not isinstance(utterance, dict) or not utterance.get("definite"):
@@ -1244,6 +1247,10 @@ class RealtimeAdapterConnection:
             await self._start_stream(pcm, timeline_origin_sample=0)
         else:
             await self.stream.send_audio(pcm)
+            # Client is actively pushing audio to an open Volcengine stream:
+            # keep the idle watchdog at bay so a slow ASR frame never tears
+            # the stream down mid-turn.
+            self._refresh_stream_idle()
         if self.detector is not None:
             self.detector.append(pcm)
 
@@ -1611,7 +1618,8 @@ class RealtimeAdapterConnection:
 
     def _refresh_stream_idle(self) -> None:
         """Bump the stream idle deadline. Called on:
-        * every ASR text frame (partial or final) via VolcengineStream on_activity,
+        * every ASR text frame or heartbeat from Volcengine (on_activity hook),
+        * every client `input_audio_buffer.append` that reaches the stream,
         * every upstream `response.done` / `response.cancelled`.
 
         No-op when the feature is disabled (timeout=0) or no stream is
