@@ -134,20 +134,11 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["gate_opened"])
         self.assertEqual(payload["gate_reason"], "proactive_reply_armed")
 
-    async def test_legacy_open_gate_is_still_supported(self):
+    async def test_invalid_bypass_gate_type(self):
         response = await self.client.post(
-            "/speak", json={"text": "hi", "open_gate": True}
+            "/speak", json={"text": "hi", "bypass_gate": "true"}
         )
-        self.assertEqual(response.status, 200)
-        self.assertTrue((await response.json())["gate_opened"])
-
-    async def test_invalid_gate_types(self):
-        for body in (
-            {"text": "hi", "bypass_gate": "true"},
-            {"text": "hi", "open_gate": "true"},
-        ):
-            response = await self.client.post("/speak", json=body)
-            self.assertEqual(response.status, 400)
+        self.assertEqual(response.status, 400)
         self.speaker.speak.assert_not_awaited()
 
     async def test_conversation_failure_does_not_open_gate(self):
@@ -164,7 +155,7 @@ class HttpTests(unittest.IsolatedAsyncioTestCase):
     async def test_gate_timeout_after_speech_is_success(self):
         self.gate_opener.side_effect = TimeoutError("gate deadline")
         response = await self.client.post(
-            "/speak", json={"text": "hi", "open_gate": True}
+            "/speak", json={"text": "hi", "bypass_gate": True}
         )
         self.assertEqual(response.status, 200)
         self.assertEqual((await response.json())["gate_reason"], "gate_open_timeout")

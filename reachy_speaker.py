@@ -541,12 +541,9 @@ def create_speak_app(
             return web.json_response({"ok": False, "error": "request body must be JSON", "route": None, "request_id": request_id}, status=400)
         text = body.get("text") if isinstance(body, dict) else None
         bypass_gate = body.get("bypass_gate", False) if isinstance(body, dict) else False
-        legacy_open_gate = body.get("open_gate", False) if isinstance(body, dict) else False
         if not isinstance(bypass_gate, bool):
             return web.json_response({"ok": False, "error": "bypass_gate must be a JSON boolean", "route": None, "request_id": request_id}, status=400)
-        if not isinstance(legacy_open_gate, bool):
-            return web.json_response({"ok": False, "error": "open_gate must be a JSON boolean", "route": None, "request_id": request_id}, status=400)
-        gate_requested = bypass_gate or legacy_open_gate
+        gate_requested = bypass_gate
         if not isinstance(text, str) or not text.strip():
             return web.json_response({"ok": False, "error": "text must be a non-empty string", "route": None, "request_id": request_id}, status=400)
         text = text.strip()
