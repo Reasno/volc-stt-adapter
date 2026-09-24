@@ -29,6 +29,7 @@ def _settings(speaker_context_enabled: bool = True) -> SimpleNamespace:
         keyword_gate_prefix_words=(),
         stop_talking_words=(),
         speaker_context_enabled=speaker_context_enabled,
+        speaker_context_window_seconds=30,
     )
 
 
@@ -37,6 +38,9 @@ class _FakeStream:
 
     def __init__(self, context):
         self.latest_speaker_context = context
+
+    def speaker_context_if_fresh(self):
+        return self.latest_speaker_context
 
 
 def _make_connection(context=None, enabled=True) -> RealtimeAdapterConnection:
@@ -53,6 +57,8 @@ class MaybeUpdateSpeakerContextTest(unittest.TestCase):
     def _new_stream(self) -> VolcengineStream:
         stream = VolcengineStream.__new__(VolcengineStream)
         stream.latest_speaker_context = None
+        stream._speaker_context_expires_at = None
+        stream.settings = SimpleNamespace(speaker_context_window_seconds=30)
         return stream
 
     def test_extracts_all_fields_from_additions(self):
@@ -194,6 +200,64 @@ class InjectSpeakerContextTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             "[Speaker context] speaker_id: 0, gender: male",
             forwarded["session"]["instructions"],
+        )
+
+
+class SpeakerContextExpirationTest(unittest.TestCase):
+    """Verify the post-response 30s TTL on `latest_speaker_context`."""
+
+    def _new_stream(self, window: float = 30.0) -> VolcengineStream:
+        stream = VolcengineStream.__new__(VolcengineStream)
+        stream.latest_speaker_context = None
+        stream._speaker_context_expires_at = None
+        stream.settings = SimpleNamespace(speaker_context_window_seconds=window)
+        return stream
+
+    def test_arm_without_context_is_noop(self):
+        stream = self._new_stream()
+        stream.arm_speaker_context_expiration()
+        self.assertIsNone(stream._speaker_context_expires_at)
+
+    def test_fresh_before_deadline(self):
+        stream = self._new_stream(window=60)
+        stream._maybe_update_speaker_context({}, {"gender": "male"}, "0")
+        stream.arm_speaker_context_expiration()
+        self.assertIsNotNone(stream._speaker_context_expires_at)
+        self.assertEqual(
+            stream.speaker_context_if_fresh(),
+            {"speaker_id": "0", "gender": "male"},
+        )
+
+    def test_expired_clears_and_returns_none(self):
+        import time as _time
+
+        stream = self._new_stream(window=30)
+        stream._maybe_update_speaker_context({}, {"gender": "male"}, "0")
+        # Simulate deadline already in the past.
+        stream._speaker_context_expires_at = _time.monotonic() - 1
+        self.assertIsNone(stream.speaker_context_if_fresh())
+        # And the stored snapshot is dropped so future injects see nothing.
+        self.assertIsNone(stream.latest_speaker_context)
+        self.assertIsNone(stream._speaker_context_expires_at)
+
+    def test_new_utterance_clears_pending_expiration(self):
+        stream = self._new_stream(window=30)
+        stream._maybe_update_speaker_context({}, {"gender": "male"}, "0")
+        stream.arm_speaker_context_expiration()
+        self.assertIsNotNone(stream._speaker_context_expires_at)
+        # A fresh utterance should reset the TTL — the new snapshot is valid
+        # for the turn it just produced.
+        stream._maybe_update_speaker_context({}, {"gender": "female"}, "1")
+        self.assertIsNone(stream._speaker_context_expires_at)
+
+    def test_zero_window_disables_ttl(self):
+        stream = self._new_stream(window=0)
+        stream._maybe_update_speaker_context({}, {"gender": "male"}, "0")
+        stream.arm_speaker_context_expiration()
+        self.assertIsNone(stream._speaker_context_expires_at)
+        self.assertEqual(
+            stream.speaker_context_if_fresh(),
+            {"speaker_id": "0", "gender": "male"},
         )
 
 

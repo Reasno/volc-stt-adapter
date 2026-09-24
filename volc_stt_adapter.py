@@ -161,6 +161,7 @@ class Settings:
     keyword_gate_prefix_words: tuple[str, ...]
     stop_talking_words: tuple[str, ...]
     speaker_context_enabled: bool
+    speaker_context_window_seconds: float
 
     @classmethod
     def from_environment(cls) -> "Settings":
@@ -293,6 +294,9 @@ class Settings:
             stop_talking_words=stop_talking_words,
             speaker_context_enabled=os.getenv("SPEAKER_CONTEXT_ENABLED", "true").strip().lower()
             in ("1", "true", "yes", "on"),
+            speaker_context_window_seconds=number(
+                "SPEAKER_CONTEXT_WINDOW_SECONDS", "30", minimum=0.0
+            ),
         )
 
 
@@ -441,6 +445,13 @@ class VolcengineStream:
         # definite utterance carrying at least one recognized field. Only raw
         # values are stored — no inference or family-member mapping is done here.
         self.latest_speaker_context: dict[str, Any] | None = None
+        # Monotonic deadline after which `latest_speaker_context` is considered
+        # stale and MUST NOT be injected into the next turn's session prompt.
+        # None = no timer armed (fresh context, or nothing observed yet). The
+        # timer is armed when the upstream response finishes (`response.done`
+        # / `response.cancelled`) and cleared whenever a new definite ASR
+        # utterance refreshes the context.
+        self._speaker_context_expires_at: float | None = None
         self.error: Exception | None = None
         self._closed = False
         # Guard against send_audio racing with reconnect swap of self.ws.
@@ -579,6 +590,34 @@ class VolcengineStream:
                 context[key] = value
         if context:
             self.latest_speaker_context = context
+            # A fresh utterance clears any pending expiration: the new snapshot
+            # is by definition still valid for the turn it just produced.
+            self._speaker_context_expires_at = None
+
+    def arm_speaker_context_expiration(self) -> None:
+        """Start the post-response TTL for the recorded speaker context.
+
+        Called by the connection when the upstream Realtime response finishes.
+        After `settings.speaker_context_window_seconds` elapse without a fresh
+        utterance refreshing the context, injection is suppressed and the
+        stored snapshot is dropped.
+        """
+        window = float(getattr(self.settings, "speaker_context_window_seconds", 30.0))
+        if window <= 0 or self.latest_speaker_context is None:
+            self._speaker_context_expires_at = None
+            return
+        self._speaker_context_expires_at = time.monotonic() + window
+
+    def speaker_context_if_fresh(self) -> dict[str, Any] | None:
+        """Return the recorded context iff it has not expired, else clear it."""
+        if self.latest_speaker_context is None:
+            return None
+        deadline = self._speaker_context_expires_at
+        if deadline is not None and time.monotonic() >= deadline:
+            self.latest_speaker_context = None
+            self._speaker_context_expires_at = None
+            return None
+        return self.latest_speaker_context
 
     def _begin_generation(self) -> None:
         """Advance origin by all local input consumed by the prior generation."""
@@ -988,6 +1027,11 @@ class RealtimeAdapterConnection:
                 self.upstream_response_active = True
             elif event_type in {"response.done", "response.cancelled"}:
                 self.upstream_response_active = False
+                # Start the speaker-context TTL from the moment the assistant
+                # finishes speaking. Any further turn that arrives after the
+                # window without a refreshing utterance will inject nothing.
+                if self.stream is not None:
+                    self.stream.arm_speaker_context_expiration()
             if event_type.startswith("conversation.item.input_audio_transcription."):
                 LOG.debug("Suppressing upstream transcription event: %s", event_type)
                 continue
@@ -1107,7 +1151,7 @@ class RealtimeAdapterConnection:
 
         context = None
         if self.settings.speaker_context_enabled and self.stream is not None:
-            context = self.stream.latest_speaker_context
+            context = self.stream.speaker_context_if_fresh()
 
         if context:
             fields = ", ".join(f"{k}: {v}" for k, v in context.items())
