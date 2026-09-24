@@ -74,6 +74,24 @@ class WakeWordDetector:
         self._last_inference_end_sample: int | None = None
         self._above_threshold = False
         self._dropped_frames = 0
+        # Debug telemetry: track the peak KWS score over a rolling window and
+        # emit one INFO line per window when the peak is non-trivial. This lets
+        # us diagnose "the mic is on but no wake fired" without dumping every
+        # frame's score. Env-configurable via WAKE_DEBUG_WINDOW_S /
+        # WAKE_DEBUG_MIN_SCORE.
+        try:
+            self._debug_window_s = float(os.getenv("WAKE_DEBUG_WINDOW_S", "1.0"))
+        except ValueError:
+            self._debug_window_s = 1.0
+        try:
+            self._debug_min_score = float(os.getenv("WAKE_DEBUG_MIN_SCORE", "0.05"))
+        except ValueError:
+            self._debug_min_score = 0.05
+        self._debug_window_frames = max(
+            1, int(self._debug_window_s * SAMPLE_RATE / FRAME_SAMPLES)
+        )
+        self._debug_frames_seen = 0
+        self._debug_window_peak = 0.0
 
     @property
     def stats(self) -> DetectorStats:
@@ -172,14 +190,23 @@ class WakeWordDetector:
                 if frame.generation != self._generation:
                     continue
                 score = max((float(value) for value in scores.values()), default=0.0)
-                amp_peak = int(np.abs(samples).max()) if samples.size else 0
-                LOG.debug(
-                    "KWS score: %.6f amp_peak=%d sample_index=%d threshold=%.3f",
-                    score,
-                    amp_peak,
-                    frame.end_sample,
-                    self.threshold,
-                )
+                # Sub-threshold telemetry: emit one line per rolling window
+                # whenever the peak score in that window is non-trivial. This
+                # is critical for tuning KWS_THRESHOLD from real data without
+                # spamming one log line per frame.
+                if score > self._debug_window_peak:
+                    self._debug_window_peak = score
+                self._debug_frames_seen += 1
+                if self._debug_frames_seen >= self._debug_window_frames:
+                    if self._debug_window_peak >= self._debug_min_score:
+                        LOG.info(
+                            "KWS score peak: %.3f (window=%.1fs, threshold=%.3f)",
+                            self._debug_window_peak,
+                            self._debug_window_s,
+                            self.threshold,
+                        )
+                    self._debug_frames_seen = 0
+                    self._debug_window_peak = 0.0
                 crossed_threshold = score >= self.threshold and not self._above_threshold
                 self._above_threshold = score >= self.threshold
                 if crossed_threshold and self.on_wake is not None:
