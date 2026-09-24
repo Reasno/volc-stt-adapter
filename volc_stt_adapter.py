@@ -22,6 +22,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import urllib.parse
+
 import aiohttp
 from aiohttp import web
 from audio_gate import AudioGate, GateMode, Utterance, WakeMarker
@@ -151,6 +153,10 @@ class Settings:
     volc_tts_cache_dir: str
     daemon_sound_timeout_s: float
     daemon_sound_cleanup_delay_s: float
+    wake_emotion_enabled: bool
+    wake_emotion_dataset: str
+    wake_emotion_name: str
+    wake_emotion_timeout_s: float
     keyword_gate_enabled: bool
     keyword_gate_prefix_words: tuple[str, ...]
     stop_talking_words: tuple[str, ...]
@@ -274,6 +280,13 @@ class Settings:
             daemon_sound_cleanup_delay_s=number(
                 "DAEMON_SOUND_CLEANUP_DELAY_SECONDS", "300", minimum=0.0
             ),
+            wake_emotion_enabled=os.getenv("WAKE_EMOTION_ENABLED", "true").strip().lower()
+            in ("1", "true", "yes", "on"),
+            wake_emotion_dataset=os.getenv(
+                "WAKE_EMOTION_DATASET", "pollen-robotics/reachy-mini-emotions-library"
+            ).strip(),
+            wake_emotion_name=os.getenv("WAKE_EMOTION_NAME", "attentive1").strip(),
+            wake_emotion_timeout_s=number("WAKE_EMOTION_TIMEOUT_SECONDS", "2", minimum=0.1),
             keyword_gate_enabled=keyword_gate_enabled,
             keyword_gate_prefix_words=keyword_gate_prefix_words,
             stop_talking_words=stop_talking_words,
@@ -1137,6 +1150,45 @@ class RealtimeAdapterConnection:
                 WakeMarker(generation, event.sample_index, event.timestamp_ms)
             )
 
+    def _trigger_wake_emotion(self) -> None:
+        """Fire-and-forget: play a short emotion on Reachy as wake feedback.
+
+        Non-blocking, best-effort. Failures are logged at debug level and never
+        interfere with the KWS/ASR pipeline.
+        """
+        if not self.settings.wake_emotion_enabled:
+            return
+        base = self.settings.reachy_daemon_url
+        name = self.settings.wake_emotion_name
+        dataset = self.settings.wake_emotion_dataset
+        if not (base and name and dataset):
+            return
+        url = (
+            f"{base}/api/move/play/recorded-move-dataset/"
+            f"{urllib.parse.quote(dataset, safe='')}/"
+            f"{urllib.parse.quote(name, safe='')}"
+        )
+        timeout = aiohttp.ClientTimeout(total=self.settings.wake_emotion_timeout_s)
+
+        async def _fire() -> None:
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as http:
+                    async with http.post(url) as response:
+                        if response.status >= 400:
+                            body = await response.text()
+                            LOG.warning(
+                                "Wake emotion POST %s -> HTTP %d: %s",
+                                url,
+                                response.status,
+                                body[:200],
+                            )
+                        else:
+                            LOG.debug("Wake emotion triggered: %s", name)
+            except Exception as exc:  # noqa: BLE001 - best-effort side channel
+                LOG.debug("Wake emotion request failed: %s", exc)
+
+        asyncio.create_task(_fire(), name="wake-emotion")
+
     async def _on_wake(self, event: WakeEvent) -> None:
         if self.detector is not None and event.detector_generation != self.detector.generation:
             LOG.debug("Ignoring stale KWS event from detector generation %d", event.detector_generation)
@@ -1148,6 +1200,7 @@ class RealtimeAdapterConnection:
             event.timestamp_ms,
             self.kws_mode.value,
         )
+        self._trigger_wake_emotion()
         if self.kws_mode is GateMode.ENFORCE and self.stream is None:
             await self._start_after_wake(event)
             return
