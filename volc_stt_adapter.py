@@ -1394,7 +1394,11 @@ class RealtimeAdapterConnection:
             event.timestamp_ms,
             self.kws_mode.value,
         )
-        self._trigger_wake_emotion()
+        # Only play the wake emotion when this wake actually opens a new
+        # conversation. Repeated wakes during an active stream are treated as
+        # gate re-arms and stay silent.
+        if self.stream is None:
+            self._trigger_wake_emotion()
         if self.kws_mode is GateMode.ENFORCE and self.stream is None:
             await self._start_after_wake(event)
             return

@@ -6,7 +6,7 @@ import json
 import unittest
 from types import SimpleNamespace
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 from audio_gate import GateMode, Utterance, WakeMarker
 from volc_stt_adapter import LiveConnectionRegistry, RealtimeAdapterConnection
@@ -251,6 +251,43 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(upstream.messages, [])
         self.assertFalse(connection._conversation_gate_open)
+
+    async def test_wake_emotion_skipped_when_stream_already_active(self):
+        """A KWS wake fired while a Volcengine stream is already open must
+        not replay the wake emotion — that's just a gate re-arm, not a fresh
+        conversation."""
+        connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
+        connection._trigger_wake_emotion = MagicMock()  # type: ignore[assignment]
+        connection.stream = SimpleNamespace(generation=3)  # type: ignore[assignment]
+
+        await connection._on_wake(
+            WakeEvent(
+                detector_generation=0,
+                sample_index=16000,
+                timestamp_ms=1000,
+                score=0.9,
+                preroll_pcm=b"",
+            )
+        )
+        connection._trigger_wake_emotion.assert_not_called()
+
+    async def test_wake_emotion_fires_on_first_wake(self):
+        """First wake (no active stream) plays the wake emotion."""
+        connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
+        connection._trigger_wake_emotion = MagicMock()  # type: ignore[assignment]
+        connection._start_after_wake = AsyncMock()  # type: ignore[assignment]
+        self.assertIsNone(connection.stream)
+
+        await connection._on_wake(
+            WakeEvent(
+                detector_generation=0,
+                sample_index=16000,
+                timestamp_ms=1000,
+                score=0.9,
+                preroll_pcm=b"",
+            )
+        )
+        connection._trigger_wake_emotion.assert_called_once()
 
 
 if __name__ == "__main__":
