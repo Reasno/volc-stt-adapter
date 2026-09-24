@@ -51,6 +51,7 @@ def settings(mode):
         kws_match_tolerance_ms=100,
         keyword_gate_enabled=True,
         keyword_gate_prefix_words=(),
+        stop_talking_words=("闭嘴", "住嘴", "停嘴", "安静", "别说了", "停止", "停下", "够了"),
     )
 
 
@@ -195,6 +196,61 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         await connection._on_native_utterance(Utterance("不应注入的文本", "bob", 2, 1400, 1800))
         self.assertEqual(downstream.messages, [])
         self.assertEqual(upstream.messages, [])
+
+    async def test_stop_talking_cancels_upstream_and_closes_gate(self):
+        """Stop-talking keyword mid-conversation cancels active response,
+        closes keep-alive window, and does not inject the utterance."""
+        connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
+        upstream = Sink(); connection.upstream = upstream
+        # Simulate an active conversation window + active upstream response.
+        import time
+        connection._keyword_gate_wildcard_deadline = time.monotonic() + 30
+        connection.upstream_response_active = True
+
+        await connection._on_native_utterance(
+            Utterance("闭嘴", "alice", 1, 100, 500)
+        )
+
+        # response.cancel should have been sent; no conversation.item.create.
+        types = [m["type"] for m in upstream.messages]
+        self.assertIn("response.cancel", types)
+        self.assertNotIn("conversation.item.create", types)
+        self.assertNotIn("response.create", types)
+        # Gate must be closed so next turn requires a fresh KWS.
+        self.assertEqual(connection._keyword_gate_wildcard_deadline, 0.0)
+        self.assertFalse(connection.upstream_response_active)
+
+    async def test_stop_talking_matches_substring_and_ignores_punctuation(self):
+        """Stop-talking match works even when the keyword appears embedded
+        in a longer utterance with punctuation."""
+        connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
+        upstream = Sink(); connection.upstream = upstream
+        import time
+        connection._keyword_gate_wildcard_deadline = time.monotonic() + 30
+        connection.upstream_response_active = True
+
+        await connection._on_native_utterance(
+            Utterance("好啦，够了，别念了。", "alice", 1, 100, 500)
+        )
+
+        self.assertIn("response.cancel", [m["type"] for m in upstream.messages])
+        self.assertEqual(connection._keyword_gate_wildcard_deadline, 0.0)
+
+    async def test_stop_talking_without_active_response_still_closes_gate(self):
+        """Even if no upstream response is active, matching a stop keyword
+        must still close the gate (and must not send response.cancel)."""
+        connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
+        upstream = Sink(); connection.upstream = upstream
+        import time
+        connection._keyword_gate_wildcard_deadline = time.monotonic() + 30
+        connection.upstream_response_active = False
+
+        await connection._on_native_utterance(
+            Utterance("安静", "alice", 1, 100, 500)
+        )
+
+        self.assertEqual(upstream.messages, [])
+        self.assertEqual(connection._keyword_gate_wildcard_deadline, 0.0)
 
 
 if __name__ == "__main__":
