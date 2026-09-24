@@ -44,7 +44,7 @@ install_file() {
 
 # Copy the explicit runtime set only. This is safe when run from INSTALL_DIR and
 # deliberately never removes an existing .venv or other on-device state.
-for file in volc_stt_adapter.py audio_gate.py wake_word.py reachy_speaker.py microwakeword_runtime.py requirements.txt; do
+for file in volc_stt_adapter.py audio_gate.py wake_word.py reachy_speaker.py requirements.txt; do
   install_file "${SOURCE_DIR}/${file}" "${INSTALL_DIR}/${file}"
 done
 install -d -o pollen -g pollen -m 0755 "${INSTALL_DIR}/models/openwakeword"

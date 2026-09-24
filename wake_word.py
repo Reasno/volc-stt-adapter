@@ -118,18 +118,6 @@ class WakeWordDetector:
         if self._model_factory is not None:
             return self._model_factory()
 
-        runtime = os.getenv("KWS_RUNTIME", "openwakeword").strip().lower()
-        if runtime == "microwakeword":
-            # Lazy import so environments without tflite/pymicro-features can
-            # still load this module when using the openwakeword backend.
-            from microwakeword_runtime import build_microwakeword_model
-
-            return build_microwakeword_model(self.model_path, cutoff=self.threshold)
-        if runtime not in {"openwakeword", ""}:
-            raise ValueError(
-                f"Unsupported KWS_RUNTIME={runtime!r}; expected 'openwakeword' or 'microwakeword'"
-            )
-
         from openwakeword.model import Model
 
         feature_dir = Path(__file__).resolve().with_name("models") / "openwakeword"
