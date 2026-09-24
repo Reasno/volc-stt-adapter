@@ -35,23 +35,6 @@ from websockets.exceptions import ConnectionClosed
 
 LOG = logging.getLogger("volc_stt_adapter")
 
-# Post-stream text gate: after the KWS opens the Volcengine stream, per-utterance
-# admission runs on the ASR transcript, not on KWS/AudioGate. If a speaker
-# says one of these words (case-insensitive substring), they get a fresh
-# KEYWORD_GATE_WINDOW_S seconds during which every subsequent utterance from
-# the same speaker_id is admitted and refreshes the window.
-KEYWORD_GATE_WORDS = (
-    "reachy", "瑞奇", "瑞琪", "瑞吉",
-    "richie", "ricky", "richey", "riche", "reach",
-)
-# Prefix wake words: only count when they appear at the utterance head. A stray
-# occurrence in the middle must not open the gate. Override via
-# VOLC_GATE_PREFIX_WORDS (comma-separated).
-DEFAULT_KEYWORD_GATE_PREFIX_WORDS = (
-    "语音", "微信", "一起", "云溪", "微启", "允许", "机器", "运气",
-)
-KEYWORD_GATE_WINDOW_S = 30.0
-
 # Hard stop-talking keywords. When any of these appears anywhere in an ASR
 # utterance during an active conversation window, the adapter immediately
 # cancels the upstream response (stops TTS) and closes the keep-alive window,
@@ -157,8 +140,6 @@ class Settings:
     wake_emotion_dataset: str
     wake_emotion_name: str
     wake_emotion_timeout_s: float
-    keyword_gate_enabled: bool
-    keyword_gate_prefix_words: tuple[str, ...]
     stop_talking_words: tuple[str, ...]
     speaker_context_enabled: bool
     speaker_context_window_seconds: float
@@ -212,17 +193,6 @@ class Settings:
         if sample_rate != SAMPLE_RATE:
             raise RuntimeError("AUDIO_SAMPLE_RATE must be 16000 when using this adapter")
         queue_frames = integer("KWS_QUEUE_FRAMES", "32", minimum=1)
-
-        prefix_words_raw = os.getenv("VOLC_GATE_PREFIX_WORDS", "").replace("，", ",")
-        keyword_gate_prefix_words: tuple[str, ...] = tuple(
-            word.strip() for word in prefix_words_raw.split(",") if word.strip()
-        ) or DEFAULT_KEYWORD_GATE_PREFIX_WORDS
-        keyword_gate_enabled = os.getenv("KEYWORD_GATE_ENABLED", "true").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
 
         stop_talking_words_raw = os.getenv("VOLC_STOP_TALKING_WORDS", "").replace("，", ",")
         stop_talking_words: tuple[str, ...] = tuple(
@@ -290,8 +260,6 @@ class Settings:
             ).strip(),
             wake_emotion_name=os.getenv("WAKE_EMOTION_NAME", "attentive1").strip(),
             wake_emotion_timeout_s=number("WAKE_EMOTION_TIMEOUT_SECONDS", "2", minimum=0.1),
-            keyword_gate_enabled=keyword_gate_enabled,
-            keyword_gate_prefix_words=keyword_gate_prefix_words,
             stop_talking_words=stop_talking_words,
             speaker_context_enabled=os.getenv("SPEAKER_CONTEXT_ENABLED", "true").strip().lower()
             in ("1", "true", "yes", "on"),
@@ -893,14 +861,10 @@ class RealtimeAdapterConnection:
         )
         self.detector: WakeWordDetector | None = None
         self._pending_wake: WakeEvent | None = None
-        # Post-stream text gate state: per-speaker window that admits every
-        # utterance from that speaker for KEYWORD_GATE_WINDOW_S after the last
-        # matching keyword. Values are monotonic-clock expiry deadlines.
-        self._keyword_gate_speakers: dict[str, float] = {}
-        # After a proactive TTS reply ends, the next utterance from any speaker
-        # is admitted once (without a keyword) and opens their normal window.
-        # Monotonic-clock deadline (0.0 = disarmed).
-        self._keyword_gate_wildcard_deadline: float = 0.0
+        # Conversation gate: True while the current KWS-opened conversation
+        # is accepting ASR utterances. Opened by KWS wake / proactive reply
+        # arming; closed by stop-talking or stream teardown.
+        self._conversation_gate_open: bool = False
         # Soft-close watchdog: closes the Volcengine stream as soon as no
         # user speech (STT final) or bot response.done arrives within
         # STREAM_IDLE_TIMEOUT_SECONDS. This is a stream/connection-level idle
@@ -1450,13 +1414,8 @@ class RealtimeAdapterConnection:
                         buffered = bytes(self._pending_stream_audio)
                         self._pending_stream_audio = bytearray()
                     await self.stream.send_audio(buffered)
-                # Arm the keep-alive window: after a KWS wake, every ASR
-                # utterance in the next KEYWORD_GATE_WINDOW_S seconds is
-                # admitted and further extends the window. Same mechanism
-                # used by arm_gate_for_reply().
-                self._keyword_gate_wildcard_deadline = (
-                    time.monotonic() + KEYWORD_GATE_WINDOW_S
-                )
+                # KWS wake opens the conversation gate for this stream.
+                self._conversation_gate_open = True
         finally:
             self._pending_wake = None
             async with self._pending_stream_audio_lock:
@@ -1472,7 +1431,7 @@ class RealtimeAdapterConnection:
         async with self._lifecycle_lock:
             lifecycle_generation = self._lifecycle_generation
             if self.stream is not None:
-                self._keyword_gate_wildcard_deadline = time.monotonic() + KEYWORD_GATE_WINDOW_S
+                self._conversation_gate_open = True
                 return self.gate.arm_for_reply(self.stream.generation)
             async with self._pending_stream_audio_lock:
                 self._stream_starting = True
@@ -1500,9 +1459,7 @@ class RealtimeAdapterConnection:
                             buffered = bytes(self._pending_stream_audio)
                             self._pending_stream_audio.clear()
                         await self.stream.send_audio(buffered)
-                    self._keyword_gate_wildcard_deadline = (
-                        time.monotonic() + KEYWORD_GATE_WINDOW_S
-                    )
+                    self._conversation_gate_open = True
                     return self.gate.arm_for_reply(self.stream.generation)
             if stale_stream is not None:
                 await self._close_stream_safely(stale_stream)
@@ -1523,9 +1480,9 @@ class RealtimeAdapterConnection:
         self._refresh_stream_idle()
 
         # Hard stop-talking interception. Matched anywhere in the transcript,
-        # runs before the keep-alive gate so that even a stale/ambiguous window
-        # cannot swallow the emergency stop. Also runs even when no upstream
-        # response is currently active (in that case we just close the gate).
+        # runs before the gate so an emergency stop cannot be swallowed. Tears
+        # down the Volcengine stream so the next turn must re-arm through KWS,
+        # mirroring the stream idle timeout path.
         stop_hit = self._match_stop_talking(transcript)
         if stop_hit is not None:
             LOG.info(
@@ -1540,21 +1497,15 @@ class RealtimeAdapterConnection:
                     {"type": "response.cancel", "event_id": f"event_{uuid.uuid4().hex}"}
                 )
                 self.upstream_response_active = False
-            # Close the keep-alive window so the next turn must re-arm through KWS.
-            self._keyword_gate_wildcard_deadline = 0.0
+            await self.clear_audio(emit_confirmation=False)
             return
 
-        # Post-stream admission is decided by the ASR transcript, not by the
-        # KWS gate. KWS only opened the stream; from here on every keep-alive /
-        # continuation of the conversation must be justified by what the ASR
-        # actually heard, so background chatter cannot keep the upstream
-        # subscription (and its billing) alive.
-        if self.settings.keyword_gate_enabled:
-            admit_reason = self._decide_text_gate(transcript, utterance.speaker_id)
-            if admit_reason is None:
-                return
-        else:
-            admit_reason = "gate_disabled"
+        # Post-stream admission is decided by the conversation gate opened by
+        # KWS wake / proactive reply arming. Anything the ASR hears counts as
+        # part of the active conversation as long as the gate is open.
+        admit_reason = self._decide_text_gate(transcript, utterance.speaker_id)
+        if admit_reason is None:
+            return
 
         LOG.info(
             "Text gate admit: reason=%s speaker_id=%s text=%s",
@@ -1605,16 +1556,11 @@ class RealtimeAdapterConnection:
     def _decide_text_gate(self, transcript: str, speaker_id: str | None) -> str | None:
         """Return an admission reason string, or None to drop the utterance.
 
-        Simple keep-alive gate: after the KWS wake (or a proactive reply arm)
-        opens the wildcard window, every ASR utterance is admitted and the
-        window is renewed for another KEYWORD_GATE_WINDOW_S. Speaker identity
-        and per-transcript keyword matching are intentionally not used —
-        anything the ASR hears counts as an active conversation as long as
-        someone keeps talking.
+        Admits every ASR utterance while the conversation gate is open. The
+        gate is opened by KWS wake / proactive reply arming, and closed by
+        stop-talking or stream teardown.
         """
-        now = time.monotonic()
-        if self._keyword_gate_wildcard_deadline > now:
-            self._keyword_gate_wildcard_deadline = now + KEYWORD_GATE_WINDOW_S
+        if self._conversation_gate_open:
             return "conversation_active"
 
         LOG.info(
@@ -1720,8 +1666,7 @@ class RealtimeAdapterConnection:
                 self._stream_starting = False
                 self._pending_stream_audio.clear()
             self.gate.clear()
-            self._keyword_gate_speakers.clear()
-            self._keyword_gate_wildcard_deadline = 0.0
+            self._conversation_gate_open = False
             self._cancel_stream_idle()
             if self.detector:
                 await self.detector.reset()

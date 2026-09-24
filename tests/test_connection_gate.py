@@ -3,14 +3,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import time
 import unittest
 from types import SimpleNamespace
 
 from unittest.mock import AsyncMock
 
 from audio_gate import GateMode, Utterance, WakeMarker
-from volc_stt_adapter import KEYWORD_GATE_WINDOW_S, LiveConnectionRegistry, RealtimeAdapterConnection
+from volc_stt_adapter import LiveConnectionRegistry, RealtimeAdapterConnection
 from wake_word import WakeEvent
 
 
@@ -50,8 +49,6 @@ def settings(mode):
         kws_trigger_timeout_seconds=3,
         kws_speaker_window_seconds=30,
         kws_match_tolerance_ms=100,
-        keyword_gate_enabled=True,
-        keyword_gate_prefix_words=(),
         stop_talking_words=("闭嘴", "住嘴", "停嘴", "安静", "别说了", "停止", "停下", "够了"),
         speaker_context_enabled=True,
     )
@@ -64,10 +61,10 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         upstream = Sink(); connection.upstream = upstream
         connection._on_stream_generation(7, 0)
         connection.gate.on_wake(WakeMarker(7, 16000, 1000))
-        # KWS wake also arms the post-stream keep-alive window (production
-        # does this inside _start_after_wake / arm_gate_for_reply); the test
-        # constructs the connection state manually so we mirror it here.
-        connection._keyword_gate_wildcard_deadline = time.monotonic() + KEYWORD_GATE_WINDOW_S
+        # KWS wake opens the conversation gate in production (_start_after_wake
+        # / arm_gate_for_reply); mirror that here since the test builds state
+        # manually.
+        connection._conversation_gate_open = True
         await connection._on_native_utterance(
             Utterance("瑞奇 请打开客厅灯", "speaker-a", 7, 850, 1400)
         )
@@ -205,12 +202,11 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_stop_talking_cancels_upstream_and_closes_gate(self):
         """Stop-talking keyword mid-conversation cancels active response,
-        closes keep-alive window, and does not inject the utterance."""
+        closes the conversation gate, and does not inject the utterance."""
         connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
         upstream = Sink(); connection.upstream = upstream
-        # Simulate an active conversation window + active upstream response.
-        import time
-        connection._keyword_gate_wildcard_deadline = time.monotonic() + 30
+        # Simulate an active conversation + active upstream response.
+        connection._conversation_gate_open = True
         connection.upstream_response_active = True
 
         await connection._on_native_utterance(
@@ -223,7 +219,7 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("conversation.item.create", types)
         self.assertNotIn("response.create", types)
         # Gate must be closed so next turn requires a fresh KWS.
-        self.assertEqual(connection._keyword_gate_wildcard_deadline, 0.0)
+        self.assertFalse(connection._conversation_gate_open)
         self.assertFalse(connection.upstream_response_active)
 
     async def test_stop_talking_matches_substring_and_ignores_punctuation(self):
@@ -231,8 +227,7 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         in a longer utterance with punctuation."""
         connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
         upstream = Sink(); connection.upstream = upstream
-        import time
-        connection._keyword_gate_wildcard_deadline = time.monotonic() + 30
+        connection._conversation_gate_open = True
         connection.upstream_response_active = True
 
         await connection._on_native_utterance(
@@ -240,15 +235,14 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn("response.cancel", [m["type"] for m in upstream.messages])
-        self.assertEqual(connection._keyword_gate_wildcard_deadline, 0.0)
+        self.assertFalse(connection._conversation_gate_open)
 
     async def test_stop_talking_without_active_response_still_closes_gate(self):
         """Even if no upstream response is active, matching a stop keyword
         must still close the gate (and must not send response.cancel)."""
         connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
         upstream = Sink(); connection.upstream = upstream
-        import time
-        connection._keyword_gate_wildcard_deadline = time.monotonic() + 30
+        connection._conversation_gate_open = True
         connection.upstream_response_active = False
 
         await connection._on_native_utterance(
@@ -256,7 +250,7 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(upstream.messages, [])
-        self.assertEqual(connection._keyword_gate_wildcard_deadline, 0.0)
+        self.assertFalse(connection._conversation_gate_open)
 
 
 if __name__ == "__main__":

@@ -62,8 +62,6 @@ def _settings() -> SimpleNamespace:
         kws_trigger_timeout_seconds=3,
         kws_speaker_window_seconds=30,
         kws_match_tolerance_ms=100,
-        keyword_gate_enabled=True,
-        keyword_gate_prefix_words=(),
         speaker_context_enabled=True,
     )
 
