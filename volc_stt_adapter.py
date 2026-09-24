@@ -1161,6 +1161,13 @@ class RealtimeAdapterConnection:
                         buffered = bytes(self._pending_stream_audio)
                         self._pending_stream_audio = bytearray()
                     await self.stream.send_audio(buffered)
+                # Arm the keep-alive window: after a KWS wake, every ASR
+                # utterance in the next KEYWORD_GATE_WINDOW_S seconds is
+                # admitted and further extends the window. Same mechanism
+                # used by arm_gate_for_reply().
+                self._keyword_gate_wildcard_deadline = (
+                    time.monotonic() + KEYWORD_GATE_WINDOW_S
+                )
         finally:
             self._pending_wake = None
             async with self._pending_stream_audio_lock:
@@ -1234,10 +1241,9 @@ class RealtimeAdapterConnection:
             admit_reason = "gate_disabled"
 
         LOG.info(
-            "Text gate admit: reason=%s speaker_id=%s active=%s text=%s",
+            "Text gate admit: reason=%s speaker_id=%s text=%s",
             admit_reason,
             utterance.speaker_id,
-            sorted(self._keyword_gate_speakers.keys()),
             transcript,
         )
 
@@ -1281,48 +1287,23 @@ class RealtimeAdapterConnection:
         LOG.info("[%s] native VAD transcript injected upstream: %s", item_id, transcript)
 
     def _decide_text_gate(self, transcript: str, speaker_id: str | None) -> str | None:
-        """Return an admission reason string, or None to drop the utterance."""
+        """Return an admission reason string, or None to drop the utterance.
+
+        Simple keep-alive gate: after the KWS wake (or a proactive reply arm)
+        opens the wildcard window, every ASR utterance is admitted and the
+        window is renewed for another KEYWORD_GATE_WINDOW_S. Speaker identity
+        and per-transcript keyword matching are intentionally not used —
+        anything the ASR hears counts as an active conversation as long as
+        someone keeps talking.
+        """
         now = time.monotonic()
-
-        # Prune expired speaker windows first so log output stays truthful.
-        expired = [sid for sid, exp in self._keyword_gate_speakers.items() if exp <= now]
-        for sid in expired:
-            LOG.info("Text gate window expired: speaker_id=%s", sid)
-            self._keyword_gate_speakers.pop(sid, None)
-
-        transcript_normalized = transcript.lower().strip()
-        transcript_head = transcript_normalized.lstrip("，。！？、,.!?~ ")
-        has_keyword = any(
-            keyword.lower().strip() in transcript_normalized
-            for keyword in KEYWORD_GATE_WORDS
-        ) or any(
-            transcript_head.startswith(prefix)
-            for prefix in self.settings.keyword_gate_prefix_words
-        )
-
-        speaker_key = speaker_id if speaker_id is not None else "__unknown__"
-
-        if has_keyword:
-            new_activation = speaker_key not in self._keyword_gate_speakers
-            self._keyword_gate_speakers[speaker_key] = now + KEYWORD_GATE_WINDOW_S
-            return "keyword_opened" if new_activation else "keyword_refreshed"
-
-        if speaker_key in self._keyword_gate_speakers:
-            # Active speaker keeps talking within their own window.
-            self._keyword_gate_speakers[speaker_key] = now + KEYWORD_GATE_WINDOW_S
-            return "speaker_window"
-
         if self._keyword_gate_wildcard_deadline > now:
-            # Proactive-reply wildcard: admit the very next utterance from
-            # anyone and open their normal keyword window.
-            self._keyword_gate_wildcard_deadline = 0.0
-            self._keyword_gate_speakers[speaker_key] = now + KEYWORD_GATE_WINDOW_S
-            return "proactive_reply_wildcard"
+            self._keyword_gate_wildcard_deadline = now + KEYWORD_GATE_WINDOW_S
+            return "conversation_active"
 
         LOG.info(
-            "Text gate suppressed: speaker_id=%s not in active set %s text=%s",
+            "Text gate suppressed: no active conversation window speaker_id=%s text=%s",
             speaker_id,
-            sorted(self._keyword_gate_speakers.keys()),
             transcript,
         )
         return None
@@ -1341,10 +1322,8 @@ class RealtimeAdapterConnection:
         )
 
     def _next_active_speaker_deadline(self) -> float:
-        """Return the latest speaker-window expiry, or 0.0 if none is active."""
-        if not self._keyword_gate_speakers:
-            return 0.0
-        return max(self._keyword_gate_speakers.values())
+        """Return the keep-alive window deadline (0.0 if not active)."""
+        return self._keyword_gate_wildcard_deadline
 
     async def _stream_idle_watchdog(self) -> None:
         try:
