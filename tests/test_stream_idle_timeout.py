@@ -171,7 +171,11 @@ class StreamIdleRefreshTest(unittest.IsolatedAsyncioTestCase):
             if conn.clear_audio.await_count:
                 break
             await asyncio.sleep(0.05)
-        conn.clear_audio.assert_awaited_once_with(emit_confirmation=False)
+        conn.clear_audio.assert_awaited_once_with(
+            emit_confirmation=False,
+            revoke_authorization=False,
+            reason="stream_idle_soft_close",
+        )
         conn._cancel_stream_idle()
 
 

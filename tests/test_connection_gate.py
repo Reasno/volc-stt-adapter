@@ -252,6 +252,46 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(upstream.messages, [])
         self.assertFalse(connection._conversation_gate_open)
 
+    async def test_soft_stream_close_preserves_and_migrates_authorization(self):
+        connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
+        stream = BlockingAudioStream()
+        stream.item_id = "old-stream"
+        connection.stream = stream
+        connection._on_stream_generation(1, 0)
+        connection.gate.on_wake(WakeMarker(1, 16000, 1000))
+        decision = connection.gate.decide(Utterance("瑞奇", "alice", 1, 900, 1100))
+        self.assertTrue(decision.allow)
+        connection._conversation_gate_open = True
+        deadline = connection.gate._deadline
+
+        await connection.clear_audio(
+            emit_confirmation=False,
+            revoke_authorization=False,
+            reason="stream_idle_soft_close",
+        )
+        self.assertTrue(connection._conversation_gate_open)
+        self.assertEqual(connection.gate._deadline, deadline)
+
+        connection._on_stream_generation(2, 16000)
+        connection.stream = SimpleNamespace(generation=2)
+        migrated = connection.gate.decide(Utterance("继续", "alice", 2, 1200, 1400))
+        rejected = connection.gate.decide(Utterance("偷听", "mallory", 2, 1400, 1600))
+        self.assertTrue(migrated.allow)
+        self.assertFalse(rejected.allow)
+        self.assertEqual(rejected.reason, "speaker_not_authorized")
+
+    async def test_explicit_clear_revokes_authorization(self):
+        connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
+        connection._on_stream_generation(1, 0)
+        connection.gate.on_wake(WakeMarker(1, 16000, 1000))
+        connection.gate.decide(Utterance("瑞奇", "alice", 1, 900, 1100))
+        connection._conversation_gate_open = True
+
+        await connection.clear_audio(emit_confirmation=False)
+
+        self.assertFalse(connection._conversation_gate_open)
+        self.assertFalse(connection.gate.decide(Utterance("继续", "alice", 1, 1200, 1400)).allow)
+
     async def test_wake_emotion_skipped_when_stream_already_active(self):
         """A KWS wake fired while a Volcengine stream is already open must
         not replay the wake emotion — that's just a gate re-arm, not a fresh

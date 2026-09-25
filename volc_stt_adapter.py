@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import os
+import random
 import signal
 import struct
 import time
@@ -18,6 +19,8 @@ import uuid
 import wave
 import weakref
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -26,7 +29,7 @@ import urllib.parse
 
 import aiohttp
 from aiohttp import web
-from audio_gate import AudioGate, GateMode, Utterance, WakeMarker
+from audio_gate import AudioGate, GateMode, GateState, Utterance, WakeMarker
 from reachy_speaker import ConversationSayClient, ReachySpeaker, create_speak_app
 from wake_word import SAMPLE_RATE, WakeEvent, WakeWordDetector
 from websockets.asyncio.client import connect
@@ -34,6 +37,11 @@ from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
 LOG = logging.getLogger("volc_stt_adapter")
+
+
+class AllocatorRateLimitedError(RuntimeError):
+    """Allocator remained rate limited after the bounded retry budget."""
+
 
 # Hard stop-talking keywords. When any of these appears anywhere in an ASR
 # utterance during an active conversation window, the adapter immediately
@@ -847,6 +855,10 @@ class VolcengineStream:
 
 
 class RealtimeAdapterConnection:
+    ALLOCATOR_MAX_ATTEMPTS = 4
+    ALLOCATOR_BACKOFF_BASE_S = 0.5
+    ALLOCATOR_BACKOFF_CAP_S = 8.0
+
     def __init__(self, websocket: ServerConnection, settings: Settings):
         self.websocket = websocket
         self.settings = settings
@@ -868,9 +880,9 @@ class RealtimeAdapterConnection:
         )
         self.detector: WakeWordDetector | None = None
         self._pending_wake: WakeEvent | None = None
-        # Conversation gate: True while the current KWS-opened conversation
-        # is accepting ASR utterances. Opened by KWS wake / proactive reply
-        # arming; closed by stop-talking or stream teardown.
+        # Conversation gate mirrors whether KWS authorization may carry across a
+        # soft Volcengine stream rollover. Explicit user clears and connection
+        # teardown revoke it.
         self._conversation_gate_open: bool = False
         # Soft-close watchdog: closes the Volcengine stream when no activity
         # (user speech or bot response) has been observed for
@@ -901,6 +913,37 @@ class RealtimeAdapterConnection:
         async with self._downstream_send_lock:
             await self.websocket.send(json.dumps(event, ensure_ascii=False))
 
+    @staticmethod
+    def _retry_after_seconds(value: str | None) -> float | None:
+        if not value:
+            return None
+        value = value.strip()
+        try:
+            seconds = float(value)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(value)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                return None
+        if not math.isfinite(seconds) or seconds < 0:
+            return None
+        return min(seconds, RealtimeAdapterConnection.ALLOCATOR_BACKOFF_CAP_S)
+
+    def _allocator_backoff(self, retry_index: int, retry_after: str | None) -> float:
+        instructed = self._retry_after_seconds(retry_after)
+        if instructed is not None:
+            return instructed
+        ceiling = min(
+            self.ALLOCATOR_BACKOFF_CAP_S,
+            self.ALLOCATOR_BACKOFF_BASE_S * (2 ** retry_index),
+        )
+        # Equal jitter prevents a synchronized retry wave without allowing a
+        # zero-delay fallback when the allocator omitted usable guidance.
+        return ceiling / 2 + random.random() * ceiling / 2
+
     async def _resolve_upstream_url(self) -> str:
         if self.settings.upstream_mode == "direct":
             if not self.settings.upstream_url:
@@ -925,9 +968,30 @@ class RealtimeAdapterConnection:
             if self.settings.hf_token:
                 headers["X-Reachy-Mini-Authorization"] = f"Bearer {self.settings.hf_token}"
             payload = {"hardware_id": hardware_id} if hardware_id else {}
-            async with http.post(self.settings.upstream_session_url, headers=headers, json=payload) as response:
-                response.raise_for_status()
-                allocation = await response.json()
+            allocation = None
+            for attempt in range(self.ALLOCATOR_MAX_ATTEMPTS):
+                async with http.post(
+                    self.settings.upstream_session_url, headers=headers, json=payload
+                ) as response:
+                    if response.status != 429:
+                        response.raise_for_status()
+                        allocation = await response.json()
+                        break
+                    retry_after = response.headers.get("Retry-After")
+                    if attempt + 1 >= self.ALLOCATOR_MAX_ATTEMPTS:
+                        raise AllocatorRateLimitedError(
+                            f"Allocator rate limited after {self.ALLOCATOR_MAX_ATTEMPTS} attempts"
+                        )
+                    delay = self._allocator_backoff(attempt, retry_after)
+                    LOG.warning(
+                        "Allocator rate limited (attempt %d/%d); retrying in %.3fs%s",
+                        attempt + 1,
+                        self.ALLOCATOR_MAX_ATTEMPTS,
+                        delay,
+                        " using Retry-After" if self._retry_after_seconds(retry_after) is not None else " with exponential backoff",
+                    )
+                await asyncio.sleep(delay)
+        assert allocation is not None
         connect_url = allocation.get("connect_url")
         if not isinstance(connect_url, str) or not connect_url:
             raise RuntimeError("Upstream allocator did not return connect_url")
@@ -1097,7 +1161,7 @@ class RealtimeAdapterConnection:
         finally:
             self._closed = True
             self.upstream = None
-            await self.clear_audio(emit_confirmation=False)
+            await self.clear_audio(emit_confirmation=False, reason="connection_closed")
             if self.detector:
                 await self.detector.close()
 
@@ -1238,8 +1302,13 @@ class RealtimeAdapterConnection:
                     self.detector.append(pcm)
                 return
         if self.kws_mode is GateMode.ENFORCE and self.stream is None:
-            # Before wake, audio is intentionally local-only. The detector's
-            # sample-indexed preroll is supplied when a wake event arrives.
+            if self._conversation_gate_open and self.gate.tick() is GateState.ACTIVE:
+                origin = self.detector.sample_index if self.detector is not None else 0
+                await self._start_stream(pcm, timeline_origin_sample=origin)
+                if self.detector is not None:
+                    self.detector.append(pcm)
+                return
+            # Without a live authorization, audio remains local-only until KWS.
             if self.detector is not None:
                 self.detector.append(pcm)
             return
@@ -1329,14 +1398,18 @@ class RealtimeAdapterConnection:
                 LOG.exception("Failed to close Volcengine stream %s", stream.item_id)
 
     def _on_stream_generation(self, generation: int, timeline_origin_sample: int) -> None:
-        self.gate.reset(generation)
+        migrated = False
+        if self._pending_wake is None and self._conversation_gate_open:
+            migrated = self.gate.migrate_generation(generation)
+        else:
+            self.gate.reset(generation)
         LOG.info(
-            "Volcengine generation reset: generation=%d origin_sample=%d; authorization revoked",
+            "Volcengine generation reset: generation=%d origin_sample=%d; KWS authorization %s",
             generation,
             timeline_origin_sample,
+            "migrated" if migrated else "not carried",
         )
-        # During enforce startup the wake precedes generation creation. Reapply
-        # it only to this newly created generation; reconnect has no pending wake.
+        # A new KWS wake is applied only to the generation it started.
         if self._pending_wake is not None:
             event = self._pending_wake
             self._pending_wake = None
@@ -1490,10 +1563,9 @@ class RealtimeAdapterConnection:
         if not transcript:
             return
 
-        # Hard stop-talking interception. Matched anywhere in the transcript,
-        # runs before the gate so an emergency stop cannot be swallowed. Tears
-        # down the Volcengine stream so the next turn must re-arm through KWS,
-        # mirroring the stream idle timeout path.
+        # Hard stop-talking interception runs before the gate so an emergency
+        # stop cannot be swallowed. Unlike idle soft-close, it explicitly
+        # revokes KWS authorization.
         stop_hit = self._match_stop_talking(transcript)
         if stop_hit is not None:
             LOG.info(
@@ -1508,13 +1580,11 @@ class RealtimeAdapterConnection:
                     {"type": "response.cancel", "event_id": f"event_{uuid.uuid4().hex}"}
                 )
                 self.upstream_response_active = False
-            await self.clear_audio(emit_confirmation=False)
+            await self.clear_audio(emit_confirmation=False, reason="stop_talking")
             return
 
-        # Post-stream admission is decided by the conversation gate opened by
-        # KWS wake / proactive reply arming. Anything the ASR hears counts as
-        # part of the active conversation as long as the gate is open.
-        admit_reason = self._decide_text_gate(transcript, utterance.speaker_id)
+        # Admission is bound to the live KWS authorization and speaker identity.
+        admit_reason = self._decide_text_gate(utterance)
         if admit_reason is None:
             return
 
@@ -1564,20 +1634,23 @@ class RealtimeAdapterConnection:
         )
         LOG.info("[%s] native VAD transcript injected upstream: %s", item_id, transcript)
 
-    def _decide_text_gate(self, transcript: str, speaker_id: str | None) -> str | None:
-        """Return an admission reason string, or None to drop the utterance.
-
-        Admits every ASR utterance while the conversation gate is open. The
-        gate is opened by KWS wake / proactive reply arming, and closed by
-        stop-talking or stream teardown.
-        """
+    def _decide_text_gate(self, utterance: Utterance) -> str | None:
+        """Admit only utterances covered by the live KWS authorization."""
         if self._conversation_gate_open:
-            return "conversation_active"
+            if self.kws_mode is not GateMode.ENFORCE:
+                return "conversation_active"
+            decision = self.gate.decide(utterance)
+            if decision.allow:
+                return decision.reason
+            reason = decision.reason
+        else:
+            reason = "conversation_closed"
 
         LOG.info(
-            "Text gate suppressed: no active conversation window speaker_id=%s text=%s",
-            speaker_id,
-            transcript,
+            "Text gate suppressed: reason=%s speaker_id=%s text=%s",
+            reason,
+            utterance.speaker_id,
+            utterance.text,
         )
         return None
 
@@ -1654,10 +1727,14 @@ class RealtimeAdapterConnection:
                 return
             LOG.info(
                 "Stream idle timeout: no ASR final or response.done activity "
-                "for %.1fs; soft-closing Volcengine stream (back to KWS wait)",
+                "for %.1fs; soft-closing Volcengine stream while preserving live KWS authorization",
                 self._stream_idle_timeout_s,
             )
-            await self.clear_audio(emit_confirmation=False)
+            await self.clear_audio(
+                emit_confirmation=False,
+                revoke_authorization=False,
+                reason="stream_idle_soft_close",
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -1670,7 +1747,13 @@ class RealtimeAdapterConnection:
         if task is not None and not task.done():
             task.cancel()
 
-    async def clear_audio(self, *, emit_confirmation: bool = True) -> None:
+    async def clear_audio(
+        self,
+        *,
+        emit_confirmation: bool = True,
+        revoke_authorization: bool = True,
+        reason: str = "explicit_clear",
+    ) -> None:
         async with self._lifecycle_lock:
             async with self._stream_lock:
                 self._lifecycle_generation += 1
@@ -1684,16 +1767,21 @@ class RealtimeAdapterConnection:
             async with self._pending_stream_audio_lock:
                 self._stream_starting = False
                 self._pending_stream_audio.clear()
-            self.gate.clear()
-            self._conversation_gate_open = False
+            if revoke_authorization:
+                self.gate.clear()
+                self._conversation_gate_open = False
             self._cancel_stream_idle()
-            if self.detector:
+            if self.detector and revoke_authorization:
                 await self.detector.reset()
         # Never hold lifecycle/stream locks while close waits on receiver/ws.
         for candidate in (stream, starting_stream):
             if candidate is not None:
                 await self._close_stream_safely(candidate)
-        LOG.info("Audio cleared; stream, detector timeline, and KWS authorization reset")
+        LOG.info(
+            "Audio cleared: reason=%s KWS_authorization=%s",
+            reason,
+            "revoked" if revoke_authorization else "preserved_until_original_deadline",
+        )
         if emit_confirmation:
             await self.emit("input_audio_buffer.cleared")
 
@@ -1746,6 +1834,10 @@ async def websocket_handler(
         registry.register(connection)
     try:
         await connection.run()
+    except AllocatorRateLimitedError:
+        LOG.warning("Allocator rate limited for %s; closing downstream", peer)
+        with contextlib.suppress(Exception):
+            await websocket.close(code=1013, reason="Allocator rate limited")
     except Exception:
         LOG.exception("Connection handler failed for %s", peer)
         with contextlib.suppress(Exception):
