@@ -25,7 +25,6 @@ def _settings(speaker_context_enabled: bool = True) -> SimpleNamespace:
         kws_trigger_timeout_seconds=3,
         kws_speaker_window_seconds=30,
         kws_match_tolerance_ms=100,
-        stop_talking_words=(),
         speaker_context_enabled=speaker_context_enabled,
         speaker_context_window_seconds=30,
         stream_idle_timeout_seconds=30,

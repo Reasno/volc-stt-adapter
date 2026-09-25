@@ -43,17 +43,6 @@ class AllocatorRateLimitedError(RuntimeError):
     """Allocator remained rate limited after the bounded retry budget."""
 
 
-# Hard stop-talking keywords. When any of these appears anywhere in an ASR
-# utterance during an active conversation window, the adapter immediately
-# cancels the upstream response (stops TTS) and closes the keep-alive window,
-# forcing the next turn to go through KWS again. Match is substring, case-
-# insensitive on the normalized transcript. Override via VOLC_STOP_TALKING_WORDS
-# (comma-separated).
-DEFAULT_STOP_TALKING_WORDS = (
-    "闭嘴", "住嘴", "停嘴", "安静", "别说了", "别念了",
-    "退出", "中止", "停止", "停下", "够了",
-)
-
 # Volcengine binary protocol constants.
 CLIENT_FULL_REQUEST = 0x1
 CLIENT_AUDIO_ONLY_REQUEST = 0x2
@@ -148,7 +137,6 @@ class Settings:
     wake_emotion_dataset: str
     wake_emotion_name: str
     wake_emotion_timeout_s: float
-    stop_talking_words: tuple[str, ...]
     speaker_context_enabled: bool
     speaker_context_window_seconds: float
     stream_idle_timeout_seconds: float
@@ -201,11 +189,6 @@ class Settings:
         if sample_rate != SAMPLE_RATE:
             raise RuntimeError("AUDIO_SAMPLE_RATE must be 16000 when using this adapter")
         queue_frames = integer("KWS_QUEUE_FRAMES", "32", minimum=1)
-
-        stop_talking_words_raw = os.getenv("VOLC_STOP_TALKING_WORDS", "").replace("，", ",")
-        stop_talking_words: tuple[str, ...] = tuple(
-            word.strip() for word in stop_talking_words_raw.split(",") if word.strip()
-        ) or DEFAULT_STOP_TALKING_WORDS
 
         return cls(
             host=os.getenv("ADAPTER_HOST", "0.0.0.0"),
@@ -268,7 +251,6 @@ class Settings:
             ).strip(),
             wake_emotion_name=os.getenv("WAKE_EMOTION_NAME", "attentive1").strip(),
             wake_emotion_timeout_s=number("WAKE_EMOTION_TIMEOUT_SECONDS", "2", minimum=0.1),
-            stop_talking_words=stop_talking_words,
             speaker_context_enabled=os.getenv("SPEAKER_CONTEXT_ENABLED", "true").strip().lower()
             in ("1", "true", "yes", "on"),
             speaker_context_window_seconds=number(
@@ -1563,26 +1545,6 @@ class RealtimeAdapterConnection:
         if not transcript:
             return
 
-        # Hard stop-talking interception runs before the gate so an emergency
-        # stop cannot be swallowed. Unlike idle soft-close, it explicitly
-        # revokes KWS authorization.
-        stop_hit = self._match_stop_talking(transcript)
-        if stop_hit is not None:
-            LOG.info(
-                "Stop-talking intercepted: keyword=%s speaker_id=%s text=%s upstream_active=%s",
-                stop_hit,
-                utterance.speaker_id,
-                transcript,
-                self.upstream_response_active,
-            )
-            if self.upstream_response_active:
-                await self._send_upstream(
-                    {"type": "response.cancel", "event_id": f"event_{uuid.uuid4().hex}"}
-                )
-                self.upstream_response_active = False
-            await self.clear_audio(emit_confirmation=False, reason="stop_talking")
-            return
-
         # Admission is controlled only by the conversation-level gate.
         admit_reason = self._decide_text_gate(utterance)
         if admit_reason is None:
@@ -1643,29 +1605,6 @@ class RealtimeAdapterConnection:
             "Text gate suppressed: reason=conversation_closed text=%s",
             utterance.text,
         )
-        return None
-
-    def _match_stop_talking(self, transcript: str) -> str | None:
-        """Return the first stop-talking keyword found in the transcript.
-
-        Matches configured stop-talking keywords as substrings on a normalized
-        transcript (Chinese punctuation stripped, lowercased). Returns the
-        matched keyword for logging, or None if nothing matches.
-        """
-        words = self.settings.stop_talking_words
-        if not words:
-            return None
-        # Normalize: strip common Chinese/ASCII punctuation and whitespace,
-        # lowercase for any latin fragments. The keywords themselves are already
-        # plain (no punctuation), so a simple substring test is enough.
-        normalized = transcript.strip().lower()
-        for ch in "，。！？、,.!?;:；：\"'“”‘’ 　\t\n\r":
-            normalized = normalized.replace(ch, "")
-        if not normalized:
-            return None
-        for word in words:
-            if word and word in normalized:
-                return word
         return None
 
     def _arm_stream_idle(self) -> None:

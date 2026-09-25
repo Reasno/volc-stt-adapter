@@ -30,7 +30,6 @@ def _settings(idle_timeout: float = 30.0) -> SimpleNamespace:
         kws_trigger_timeout_seconds=3,
         kws_speaker_window_seconds=30,
         kws_match_tolerance_ms=100,
-        stop_talking_words=(),
         speaker_context_enabled=False,
         speaker_context_window_seconds=30,
         stream_idle_timeout_seconds=idle_timeout,
