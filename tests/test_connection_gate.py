@@ -144,7 +144,7 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         connection._start_stream = start
         self.assertTrue(await connection.arm_gate_for_reply())
         self.assertEqual(stream.sent, [])
-        self.assertTrue(connection.gate._proactive_reply_pending)
+        self.assertTrue(connection.gate.proactive_reply_armed)
 
     async def test_proactive_open_reuses_existing_stream(self):
         connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
@@ -170,7 +170,7 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         await connection.clear_audio(emit_confirmation=False)
         release.set()
         self.assertFalse(await task)
-        self.assertFalse(connection.gate._proactive_reply_pending)
+        self.assertFalse(connection.gate.proactive_reply_armed)
 
     async def test_registry_cardinality_mode_and_unregister(self):
         registry = LiveConnectionRegistry("enforce")
@@ -303,13 +303,14 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
         connection._on_stream_generation(1, 0)
         connection.gate.on_wake(WakeMarker(1, 16000, 1000))
-        connection.gate.decide(Utterance("瑞奇", "alice", 1, 900, 1100))
         connection._conversation_gate_open = True
 
         await connection.clear_audio(emit_confirmation=False)
 
         self.assertFalse(connection._conversation_gate_open)
-        self.assertFalse(connection.gate.decide(Utterance("继续", "alice", 1, 1200, 1400)).allow)
+        self.assertIsNone(
+            connection._decide_text_gate(Utterance("继续", "alice", 1, 1200, 1400))
+        )
 
     async def test_wake_emotion_skipped_when_stream_already_active(self):
         """A KWS wake fired while a Volcengine stream is already open must
