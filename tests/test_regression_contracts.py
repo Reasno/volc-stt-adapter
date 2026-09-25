@@ -70,18 +70,18 @@ class RegressionContractsTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("gate_sleeping", runtime_source)
         self.assertNotIn("speaker_not_authorized", runtime_source)
 
-    async def test_soft_close_preserves_authorization(self):
+    async def test_soft_close_revokes_authorization(self):
         connection = self.make_connection()
         connection._conversation_gate_open = True
         connection.stream = SimpleNamespace(close=AsyncMock(), item_id="stream")
 
         await connection.clear_audio(
             emit_confirmation=False,
-            revoke_authorization=False,
+            revoke_authorization=True,
             reason="stream_idle_soft_close",
         )
 
-        self.assertTrue(connection._conversation_gate_open)
+        self.assertFalse(connection._conversation_gate_open)
 
     async def test_explicit_clear_revokes_authorization(self):
         connection = self.make_connection()
@@ -155,7 +155,7 @@ class RegressionContractsTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         connection.clear_audio.assert_awaited_once_with(
             emit_confirmation=False,
-            revoke_authorization=False,
+            revoke_authorization=True,
             reason="stream_idle_soft_close",
         )
         connection._cancel_stream_idle()

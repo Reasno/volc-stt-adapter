@@ -14,6 +14,7 @@ Verifies that:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import time
 import unittest
@@ -43,6 +44,10 @@ class _FakeVolcStream:
     def __init__(self):
         self.latest_speaker_context = None
         self.armed = False
+        self.item_id = "fake-stream"
+
+    async def send_audio(self, pcm):
+        return None
 
     def speaker_context_if_fresh(self):
         return None
@@ -172,7 +177,24 @@ class StreamIdleRefreshTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
         conn.clear_audio.assert_awaited_once_with(
             emit_confirmation=False,
-            revoke_authorization=False,
+            revoke_authorization=True,
+            reason="stream_idle_soft_close",
+        )
+        conn._cancel_stream_idle()
+
+    async def test_continuous_silent_pcm_does_not_refresh_watchdog(self):
+        conn = await self._make_connection(0.05)
+        conn.clear_audio = AsyncMock()  # type: ignore[assignment]
+        conn._arm_stream_idle()
+        message = {"audio": base64.b64encode(b"\x00\x00" * 160).decode()}
+
+        for _ in range(10):
+            await conn.handle_audio_append(message)
+            await asyncio.sleep(0.01)
+
+        conn.clear_audio.assert_awaited_once_with(
+            emit_confirmation=False,
+            revoke_authorization=True,
             reason="stream_idle_soft_close",
         )
         conn._cancel_stream_idle()

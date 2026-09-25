@@ -747,11 +747,6 @@ class VolcengineStream:
                 while True:
                     response = await self._receive_one()
                     self._raise_for_error(response)
-                    # Any frame from Volcengine (even an empty heartbeat)
-                    # proves the session is alive; refresh the adapter's idle
-                    # watchdog so it doesn't tear down the stream mid-turn.
-                    if self.on_activity is not None:
-                        self.on_activity()
                     payload = response.get("payload")
                     if isinstance(payload, dict):
                         result = payload.get("result")
@@ -760,6 +755,8 @@ class VolcengineStream:
                             text = str(result.get("text") or "").strip()
                             if text:
                                 self.latest_text = text
+                                if self.on_activity is not None:
+                                    self.on_activity()
                             utterances = result.get("utterances") or []
                             for utterance in utterances:
                                 if not isinstance(utterance, dict) or not utterance.get("definite"):
@@ -1082,7 +1079,7 @@ class RealtimeAdapterConnection:
                 # Bot just finished talking — restart the idle countdown so
                 # the user has the full STREAM_IDLE_TIMEOUT_SECONDS to respond
                 # before the stream is torn down.
-                self._refresh_stream_idle()
+                self._refresh_stream_idle(f"upstream_{event_type}")
             if event_type.startswith("conversation.item.input_audio_transcription."):
                 LOG.debug("Suppressing upstream transcription event: %s", event_type)
                 continue
@@ -1285,6 +1282,7 @@ class RealtimeAdapterConnection:
                 return
         if self.kws_mode is GateMode.ENFORCE and self.stream is None:
             if self._conversation_gate_open:
+                LOG.info("Stream reopen: reason=preserved_authorization")
                 origin = self.detector.sample_index if self.detector is not None else 0
                 await self._start_stream(pcm, timeline_origin_sample=origin)
                 if self.detector is not None:
@@ -1298,10 +1296,6 @@ class RealtimeAdapterConnection:
             await self._start_stream(pcm, timeline_origin_sample=0)
         else:
             await self.stream.send_audio(pcm)
-            # Client is actively pushing audio to an open Volcengine stream:
-            # keep the idle watchdog at bay so a slow ASR frame never tears
-            # the stream down mid-turn.
-            self._refresh_stream_idle()
         if self.detector is not None:
             self.detector.append(pcm)
 
@@ -1320,7 +1314,7 @@ class RealtimeAdapterConnection:
                     self._on_native_utterance,
                     self._on_stream_generation,
                     timeline_origin_sample=timeline_origin_sample,
-                    on_activity=self._refresh_stream_idle,
+                    on_activity=lambda: self._refresh_stream_idle("asr_text"),
                 )
                 lifecycle_generation = self._lifecycle_generation
                 self._starting_stream = starting_stream
@@ -1465,6 +1459,7 @@ class RealtimeAdapterConnection:
             self._conversation_gate_open = True
             return
         self._pending_wake = event
+        LOG.info("Stream reopen: reason=kws_wake")
         async with self._pending_stream_audio_lock:
             self._stream_starting = True
         try:
@@ -1616,6 +1611,11 @@ class RealtimeAdapterConnection:
         if self._stream_idle_timeout_s <= 0:
             return
         self._stream_idle_deadline = time.monotonic() + self._stream_idle_timeout_s
+        LOG.debug(
+            "Stream idle watchdog armed: reason=stream_started deadline=%.3f stream_id=%s",
+            self._stream_idle_deadline,
+            self.item_id,
+        )
         task = self._stream_watchdog_task
         if task is not None and not task.done():
             return
@@ -1623,20 +1623,24 @@ class RealtimeAdapterConnection:
             self._stream_idle_watchdog(), name="volc-stream-idle-watchdog"
         )
 
-    def _refresh_stream_idle(self) -> None:
-        """Bump the stream idle deadline. Called on:
-        * every ASR text frame or heartbeat from Volcengine (on_activity hook),
-        * every client `input_audio_buffer.append` that reaches the stream,
-        * every upstream `response.done` / `response.cancelled`.
+    def _refresh_stream_idle(self, reason: str = "activity") -> None:
+        """Bump the deadline for meaningful conversation activity only.
 
-        No-op when the feature is disabled (timeout=0) or no stream is
-        currently open / starting.
+        Valid activity is recognized ASR text, an upstream response terminal
+        event, or an explicit local-VAD speech event. Raw PCM and empty ASR
+        heartbeat frames must not keep an otherwise idle stream alive.
         """
         if self._stream_idle_timeout_s <= 0:
             return
         if self.stream is None and not self._stream_starting:
             return
         self._stream_idle_deadline = time.monotonic() + self._stream_idle_timeout_s
+        LOG.debug(
+            "Stream idle watchdog refreshed: reason=%s deadline=%.3f stream_id=%s",
+            reason,
+            self._stream_idle_deadline,
+            self.item_id,
+        )
 
     async def _stream_idle_watchdog(self) -> None:
         try:
@@ -1651,18 +1655,23 @@ class RealtimeAdapterConnection:
                 # after response.done / response.cancelled fires.
                 if self.upstream_response_active:
                     self._stream_idle_deadline = now + self._stream_idle_timeout_s
+                    LOG.debug(
+                        "Stream idle watchdog refreshed: reason=upstream_response_active deadline=%.3f stream_id=%s",
+                        self._stream_idle_deadline,
+                        self.item_id,
+                    )
                     continue
                 break
             if self._closed or self.stream is None:
                 return
             LOG.info(
-                "Stream idle timeout: no ASR final or response.done activity "
-                "for %.1fs; soft-closing Volcengine stream while preserving live KWS authorization",
+                "Stream idle timeout: no meaningful conversation activity "
+                "for %.1fs; soft-closing Volcengine stream and revoking KWS authorization",
                 self._stream_idle_timeout_s,
             )
             await self.clear_audio(
                 emit_confirmation=False,
-                revoke_authorization=False,
+                revoke_authorization=True,
                 reason="stream_idle_soft_close",
             )
         except asyncio.CancelledError:
@@ -1693,6 +1702,15 @@ class RealtimeAdapterConnection:
                 self._starting_stream = None
                 self.item_id = None
             self._pcm_leftover = b""
+            stream_id = getattr(stream, "item_id", None)
+            starting_stream_id = getattr(starting_stream, "item_id", None)
+            LOG.info(
+                "Audio close begin: reason=%s stream_id=%s starting_stream_id=%s revoke_authorization=%s",
+                reason,
+                stream_id,
+                starting_stream_id,
+                revoke_authorization,
+            )
             self._pending_wake = None
             async with self._pending_stream_audio_lock:
                 self._stream_starting = False
@@ -1708,8 +1726,12 @@ class RealtimeAdapterConnection:
             if candidate is not None:
                 await self._close_stream_safely(candidate)
         LOG.info(
-            "Audio cleared: reason=%s KWS_authorization=%s",
+            "Audio close complete: reason=%s closed_stream_id=%s closed_starting_stream_id=%s "
+            "current_stream_id=%s KWS_authorization=%s",
             reason,
+            stream_id,
+            starting_stream_id,
+            getattr(self.stream, "item_id", None),
             "revoked" if revoke_authorization else "preserved_until_original_deadline",
         )
         if emit_confirmation:

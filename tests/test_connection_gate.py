@@ -224,7 +224,7 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reason=conversation_closed", logs)
         self.assertNotIn("speaker_id=", logs)
 
-    async def test_soft_stream_close_preserves_boolean_conversation_gate(self):
+    async def test_soft_stream_close_revokes_boolean_conversation_gate(self):
         connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
         stream = BlockingAudioStream()
         stream.item_id = "old-stream"
@@ -233,17 +233,16 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
 
         await connection.clear_audio(
             emit_confirmation=False,
-            revoke_authorization=False,
+            revoke_authorization=True,
             reason="stream_idle_soft_close",
         )
 
-        self.assertTrue(connection._conversation_gate_open)
+        self.assertFalse(connection._conversation_gate_open)
         connection._on_stream_generation(2, 16000)
-        self.assertEqual(
+        self.assertIsNone(
             connection._decide_text_gate(
                 Utterance("继续", "another-speaker", 2, 1200, 1400)
-            ),
-            "conversation_active",
+            )
         )
 
     async def test_explicit_clear_revokes_authorization(self):
