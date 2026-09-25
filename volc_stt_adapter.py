@@ -29,7 +29,7 @@ import urllib.parse
 
 import aiohttp
 from aiohttp import web
-from audio_gate import AudioGate, GateMode, GateState, Utterance, WakeMarker
+from audio_gate import AudioGate, GateMode, Utterance, WakeMarker
 from reachy_speaker import ConversationSayClient, ReachySpeaker, create_speak_app
 from wake_word import SAMPLE_RATE, WakeEvent, WakeWordDetector
 from websockets.asyncio.client import connect
@@ -1302,13 +1302,13 @@ class RealtimeAdapterConnection:
                     self.detector.append(pcm)
                 return
         if self.kws_mode is GateMode.ENFORCE and self.stream is None:
-            if self._conversation_gate_open and self.gate.tick() is GateState.ACTIVE:
+            if self._conversation_gate_open:
                 origin = self.detector.sample_index if self.detector is not None else 0
                 await self._start_stream(pcm, timeline_origin_sample=origin)
                 if self.detector is not None:
                     self.detector.append(pcm)
                 return
-            # Without a live authorization, audio remains local-only until KWS.
+            # Without an open conversation, audio remains local-only until KWS.
             if self.detector is not None:
                 self.detector.append(pcm)
             return
@@ -1398,18 +1398,14 @@ class RealtimeAdapterConnection:
                 LOG.exception("Failed to close Volcengine stream %s", stream.item_id)
 
     def _on_stream_generation(self, generation: int, timeline_origin_sample: int) -> None:
-        migrated = False
-        if self._pending_wake is None and self._conversation_gate_open:
-            migrated = self.gate.migrate_generation(generation)
-        else:
-            self.gate.reset(generation)
+        self.gate.reset(generation)
         LOG.info(
-            "Volcengine generation reset: generation=%d origin_sample=%d; KWS authorization %s",
+            "Volcengine generation reset: generation=%d origin_sample=%d",
             generation,
             timeline_origin_sample,
-            "migrated" if migrated else "not carried",
         )
-        # A new KWS wake is applied only to the generation it started.
+        # During enforce startup the wake precedes generation creation. Reapply
+        # it only to this newly created generation; reconnect has no pending wake.
         if self._pending_wake is not None:
             event = self._pending_wake
             self._pending_wake = None
@@ -1477,12 +1473,14 @@ class RealtimeAdapterConnection:
             return
         generation = self.stream.generation if self.stream is not None else 0
         self.gate.on_wake(WakeMarker(generation, event.sample_index, event.timestamp_ms))
+        self._conversation_gate_open = True
 
     async def _start_after_wake(self, event: WakeEvent) -> None:
         if self.stream is not None:
             self.gate.on_wake(
                 WakeMarker(self.stream.generation, event.sample_index, event.timestamp_ms)
             )
+            self._conversation_gate_open = True
             return
         self._pending_wake = event
         async with self._pending_stream_audio_lock:
@@ -1520,8 +1518,9 @@ class RealtimeAdapterConnection:
         async with self._lifecycle_lock:
             lifecycle_generation = self._lifecycle_generation
             if self.stream is not None:
+                self.gate.arm_for_reply(self.stream.generation)
                 self._conversation_gate_open = True
-                return self.gate.arm_for_reply(self.stream.generation)
+                return True
             async with self._pending_stream_audio_lock:
                 self._stream_starting = True
         try:
@@ -1548,8 +1547,9 @@ class RealtimeAdapterConnection:
                             buffered = bytes(self._pending_stream_audio)
                             self._pending_stream_audio.clear()
                         await self.stream.send_audio(buffered)
+                    self.gate.arm_for_reply(self.stream.generation)
                     self._conversation_gate_open = True
-                    return self.gate.arm_for_reply(self.stream.generation)
+                    return True
             if stale_stream is not None:
                 await self._close_stream_safely(stale_stream)
             return False
@@ -1583,7 +1583,7 @@ class RealtimeAdapterConnection:
             await self.clear_audio(emit_confirmation=False, reason="stop_talking")
             return
 
-        # Admission is bound to the live KWS authorization and speaker identity.
+        # Admission is controlled only by the conversation-level gate.
         admit_reason = self._decide_text_gate(utterance)
         if admit_reason is None:
             return
@@ -1635,21 +1635,12 @@ class RealtimeAdapterConnection:
         LOG.info("[%s] native VAD transcript injected upstream: %s", item_id, transcript)
 
     def _decide_text_gate(self, utterance: Utterance) -> str | None:
-        """Admit only utterances covered by the live KWS authorization."""
+        """Use the conversation-level boolean as the sole text gate."""
         if self._conversation_gate_open:
-            if self.kws_mode is not GateMode.ENFORCE:
-                return "conversation_active"
-            decision = self.gate.decide(utterance)
-            if decision.allow:
-                return decision.reason
-            reason = decision.reason
-        else:
-            reason = "conversation_closed"
+            return "conversation_active"
 
         LOG.info(
-            "Text gate suppressed: reason=%s speaker_id=%s text=%s",
-            reason,
-            utterance.speaker_id,
+            "Text gate suppressed: reason=conversation_closed text=%s",
             utterance.text,
         )
         return None

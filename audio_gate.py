@@ -116,27 +116,6 @@ class AudioGate:
 
     clear = reset
 
-    def migrate_generation(self, stream_generation: int) -> bool:
-        """Move a still-valid authorization to a replacement ASR generation.
-
-        A soft stream rollover changes Volcengine's speaker-id namespace but is
-        not a user intent to end the conversation.  Preserve the remaining TTL
-        while rebinding the identity to the new generation.  Expired or
-        unauthorised state is never promoted by migration.
-        """
-        self._advance()
-        old_generation = self.stream_generation
-        self.stream_generation = stream_generation
-        if self.state is not GateState.ACTIVE:
-            return False
-        if self.identity is not None:
-            generation, speaker_id = self.identity
-            if generation != old_generation:
-                self.reset(stream_generation)
-                return False
-            self.identity = (stream_generation, speaker_id)
-        return True
-
     def arm_for_reply(self, stream_generation: int) -> bool:
         """Authorize one proactive reply, binding its first SSD identity.
 

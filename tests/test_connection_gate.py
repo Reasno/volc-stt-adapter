@@ -188,17 +188,42 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         off.register(first)
         self.assertEqual(await off.open_gate(), (False, "gate_not_enforced"))
 
-    async def test_other_speaker_is_not_injected(self):
+    async def test_open_conversation_admits_every_speaker(self):
         downstream = Sink()
         connection = RealtimeAdapterConnection(downstream, settings("enforce"))
         upstream = Sink(); connection.upstream = upstream
-        connection._on_stream_generation(2, 0)
-        connection.gate.on_wake(WakeMarker(2, 16000, 1000))
-        await connection._on_native_utterance(Utterance("瑞奇 唤醒首句", "alice", 2, 900, 1300))
-        downstream.messages.clear(); upstream.messages.clear()
-        await connection._on_native_utterance(Utterance("不应注入的文本", "bob", 2, 1400, 1800))
+        connection._conversation_gate_open = True
+
+        utterances = (
+            Utterance("第一句", "alice", 2, 900, 1300),
+            Utterance("第二句", "bob", 2, 1400, 1800),
+            Utterance("第三句", None, 99, 1900, 2200),
+        )
+        for utterance in utterances:
+            await connection._on_native_utterance(utterance)
+
+        injected = [
+            message["item"]["content"][0]["text"]
+            for message in upstream.messages
+            if message["type"] == "conversation.item.create"
+        ]
+        self.assertEqual(injected, [utterance.text for utterance in utterances])
+
+    async def test_closed_conversation_suppresses_with_only_closed_reason(self):
+        downstream = Sink()
+        connection = RealtimeAdapterConnection(downstream, settings("enforce"))
+        upstream = Sink(); connection.upstream = upstream
+
+        with self.assertLogs("volc_stt_adapter", level="INFO") as captured:
+            await connection._on_native_utterance(
+                Utterance("关闭时不注入", "speaker-3", 7, 100, 500)
+            )
+
         self.assertEqual(downstream.messages, [])
         self.assertEqual(upstream.messages, [])
+        logs = "\n".join(captured.output)
+        self.assertIn("reason=conversation_closed", logs)
+        self.assertNotIn("speaker_id=", logs)
 
     async def test_stop_talking_cancels_upstream_and_closes_gate(self):
         """Stop-talking keyword mid-conversation cancels active response,
@@ -252,33 +277,27 @@ class ConnectionGateTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(upstream.messages, [])
         self.assertFalse(connection._conversation_gate_open)
 
-    async def test_soft_stream_close_preserves_and_migrates_authorization(self):
+    async def test_soft_stream_close_preserves_boolean_conversation_gate(self):
         connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
         stream = BlockingAudioStream()
         stream.item_id = "old-stream"
         connection.stream = stream
-        connection._on_stream_generation(1, 0)
-        connection.gate.on_wake(WakeMarker(1, 16000, 1000))
-        decision = connection.gate.decide(Utterance("瑞奇", "alice", 1, 900, 1100))
-        self.assertTrue(decision.allow)
         connection._conversation_gate_open = True
-        deadline = connection.gate._deadline
 
         await connection.clear_audio(
             emit_confirmation=False,
             revoke_authorization=False,
             reason="stream_idle_soft_close",
         )
-        self.assertTrue(connection._conversation_gate_open)
-        self.assertEqual(connection.gate._deadline, deadline)
 
+        self.assertTrue(connection._conversation_gate_open)
         connection._on_stream_generation(2, 16000)
-        connection.stream = SimpleNamespace(generation=2)
-        migrated = connection.gate.decide(Utterance("继续", "alice", 2, 1200, 1400))
-        rejected = connection.gate.decide(Utterance("偷听", "mallory", 2, 1400, 1600))
-        self.assertTrue(migrated.allow)
-        self.assertFalse(rejected.allow)
-        self.assertEqual(rejected.reason, "speaker_not_authorized")
+        self.assertEqual(
+            connection._decide_text_gate(
+                Utterance("继续", "another-speaker", 2, 1200, 1400)
+            ),
+            "conversation_active",
+        )
 
     async def test_explicit_clear_revokes_authorization(self):
         connection = RealtimeAdapterConnection(Sink(), settings("enforce"))
