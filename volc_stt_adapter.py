@@ -131,6 +131,9 @@ class Settings:
     volc_tts_max_audio_bytes: int
     volc_tts_cache_entries: int
     volc_tts_cache_dir: str
+    kws_save_dir: str
+    kws_save_max_age_days: int
+    kws_save_max_size_mb: int
     daemon_sound_timeout_s: float
     daemon_sound_cleanup_delay_s: float
     wake_emotion_enabled: bool
@@ -207,7 +210,10 @@ class Settings:
                 str(Path(__file__).with_name("models") / "reechy-spk150-steps100k-acc98.15-rec97.50.onnx"),
             ).strip(),
             kws_threshold=number("KWS_THRESHOLD", "0.5", minimum=0.0, maximum=1.0),
-            kws_preroll_seconds=number("KWS_PREROLL_SECONDS", "1.5", minimum=0.0),
+            kws_preroll_seconds=number("KWS_PREROLL_SECONDS", "3.0", minimum=0.0),
+            kws_save_dir=os.getenv("KWS_SAVE_AUDIO_DIR", "/opt/volc-stt-adapter/false_wakes").strip(),
+            kws_save_max_age_days=integer("KWS_SAVE_MAX_AGE_DAYS", "30", minimum=1),
+            kws_save_max_size_mb=integer("KWS_SAVE_MAX_SIZE_MB", "500", minimum=1),
             kws_trigger_timeout_seconds=number("KWS_TRIGGER_TIMEOUT_SECONDS", "3", minimum=0.001),
             kws_speaker_window_seconds=number("KWS_SPEAKER_WINDOW_SECONDS", "30", minimum=0.001),
             kws_match_tolerance_ms=number("KWS_MATCH_TOLERANCE_MS", "400", minimum=0.0),
@@ -833,6 +839,90 @@ class VolcengineStream:
                 return
 
 
+async def cleanup_wake_audio(directory: str, max_age_days: int, max_size_mb: int) -> None:
+    """Purge wake recordings older than max_age_days or exceeding max_size_mb."""
+    path = Path(directory)
+    if not path.is_dir():
+        return
+
+    def _do_cleanup():
+        now = time.time()
+        max_age_s = max_age_days * 86400
+        files = []
+        try:
+            for f in path.glob("false_wake_*.wav"):
+                stat = f.stat()
+                if now - stat.st_mtime > max_age_s:
+                    with contextlib.suppress(OSError):
+                        f.unlink()
+                    continue
+                files.append((stat.st_mtime, stat.st_size, f))
+
+            files.sort()  # Oldest first
+            total_size = sum(f[1] for f in files)
+            max_size_bytes = max_size_mb * 1024 * 1024
+
+            while total_size > max_size_bytes and files:
+                _, size, f = files.pop(0)
+                with contextlib.suppress(OSError):
+                    f.unlink()
+                total_size -= size
+        except Exception as exc:
+            LOG.warning("Wake audio cleanup failed: %s", exc)
+
+    await asyncio.to_thread(_do_cleanup)
+
+
+class WakeRecorder:
+    """Stateful collector for 3s pre-roll + 5s post-roll wake audio."""
+
+    def __init__(self, directory: Path, score: float, preroll: bytes, postroll_samples: int):
+        self.directory = directory
+        self.score = score
+        self.pcm = bytearray(preroll)
+        self.postroll_samples = postroll_samples
+        self.samples_needed = postroll_samples
+        self.finished = False
+        self.timestamp = datetime.now()
+
+    def append(self, pcm: bytes) -> None:
+        if self.finished:
+            return
+        take_bytes = min(len(pcm), self.samples_needed * 2)
+        self.pcm.extend(pcm[:take_bytes])
+        self.samples_needed -= take_bytes // 2
+        if self.samples_needed <= 0:
+            self.finished = True
+
+    async def save(self, sample_rate: int, max_age_days: int, max_size_mb: int) -> None:
+        if not self.pcm:
+            return
+
+        def _write():
+            self.directory.mkdir(parents=True, exist_ok=True)
+            ts = self.timestamp.strftime("%Y%m%d_%H%M%S_%f")
+            base_name = f"false_wake_{ts}_{self.score:.3f}"
+            path = self.directory / f"{base_name}.wav"
+            if path.exists():
+                path = self.directory / f"{base_name}_{uuid.uuid4().hex[:8]}.wav"
+
+            try:
+                with wave.open(str(path), "wb") as f:
+                    f.setnchannels(1)
+                    f.setsampwidth(2)
+                    f.setframerate(sample_rate)
+                    f.writeframes(self.pcm)
+                return path
+            except Exception as exc:
+                LOG.error("Failed to save wake audio to %s: %s", path, exc)
+                return None
+
+        saved_path = await asyncio.to_thread(_write)
+        if saved_path:
+            LOG.info("Saved KWS wake audio: %s", saved_path)
+            await cleanup_wake_audio(str(self.directory), max_age_days, max_size_mb)
+
+
 class RealtimeAdapterConnection:
     ALLOCATOR_MAX_ATTEMPTS = 4
     ALLOCATOR_BACKOFF_BASE_S = 0.5
@@ -859,6 +949,8 @@ class RealtimeAdapterConnection:
         )
         self.detector: WakeWordDetector | None = None
         self._pending_wake: WakeEvent | None = None
+        self._wake_recorders: list[WakeRecorder] = []
+        self._save_tasks: set[asyncio.Task] = set()
         # Conversation gate mirrors whether KWS authorization may carry across a
         # soft Volcengine stream rollover. Explicit user clears and connection
         # teardown revoke it.
@@ -1141,6 +1233,11 @@ class RealtimeAdapterConnection:
             self._closed = True
             self.upstream = None
             await self.clear_audio(emit_confirmation=False, reason="connection_closed")
+            if self._save_tasks:
+                # Wait up to 5s for pending audio saves to finish before process exit.
+                _, pending = await asyncio.wait(self._save_tasks, timeout=5.0)
+                if pending:
+                    LOG.warning("Closing connection with %d pending KWS saves", len(pending))
             if self.detector:
                 await self.detector.close()
 
@@ -1296,6 +1393,22 @@ class RealtimeAdapterConnection:
             await self._start_stream(pcm, timeline_origin_sample=0)
         else:
             await self.stream.send_audio(pcm)
+
+        # Record wake post-roll if any recorders are active.
+        for r in list(self._wake_recorders):
+            r.append(pcm)
+            if r.finished:
+                task = asyncio.create_task(
+                    r.save(
+                        self.settings.sample_rate,
+                        self.settings.kws_save_max_age_days,
+                        self.settings.kws_save_max_size_mb,
+                    )
+                )
+                self._save_tasks.add(task)
+                task.add_done_callback(self._save_tasks.discard)
+                self._wake_recorders.remove(r)
+
         if self.detector is not None:
             self.detector.append(pcm)
 
@@ -1444,6 +1557,17 @@ class RealtimeAdapterConnection:
         # gate re-arms and stay silent.
         if self.stream is None:
             self._trigger_wake_emotion()
+
+        # Start a new wake recording session.
+        self._wake_recorders.append(
+            WakeRecorder(
+                Path(self.settings.kws_save_dir),
+                event.score,
+                event.preroll_pcm,
+                postroll_samples=5 * self.settings.sample_rate,
+            )
+        )
+
         if self.kws_mode is GateMode.ENFORCE and self.stream is None:
             await self._start_after_wake(event)
             return
@@ -1712,6 +1836,18 @@ class RealtimeAdapterConnection:
                 revoke_authorization,
             )
             self._pending_wake = None
+            # Finalize any pending wake recordings even on early closure.
+            for r in self._wake_recorders:
+                task = asyncio.create_task(
+                    r.save(
+                        self.settings.sample_rate,
+                        self.settings.kws_save_max_age_days,
+                        self.settings.kws_save_max_size_mb,
+                    )
+                )
+                self._save_tasks.add(task)
+                task.add_done_callback(self._save_tasks.discard)
+            self._wake_recorders.clear()
             async with self._pending_stream_audio_lock:
                 self._stream_starting = False
                 self._pending_stream_audio.clear()

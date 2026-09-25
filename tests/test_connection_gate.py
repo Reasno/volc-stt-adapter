@@ -50,6 +50,10 @@ def settings(mode):
         kws_speaker_window_seconds=30,
         kws_match_tolerance_ms=100,
         speaker_context_enabled=True,
+        sample_rate=16000,
+        kws_save_dir="/tmp/wakes",
+        kws_save_max_age_days=30,
+        kws_save_max_size_mb=500,
     )
 
 
